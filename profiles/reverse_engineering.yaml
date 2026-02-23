@@ -1,0 +1,27 @@
+# Reverse engineering workload profile for llama-bench
+name: reverse_engineering
+description: >
+  Profile optimized for reverse engineering tasks: large prompts with many
+  follow-ups sharing a long prefix (binary analysis, decompilation sessions).
+
+# Search space overrides from defaults
+search_space:
+  np: [1, 2]
+  ctx: [49152, 98304]
+  n_gpu_layers: [40, 45, 47]
+  flash_attn: [true]
+  batch_size: [1024, 1536, 2048]
+  ubatch_size: [256, 512]
+  kv_cache_type_k: ["q8_0", "f16"]
+  kv_cache_type_v: ["q8_0", "f16"]
+  kv_unified: [true]
+  cache_reuse: [256, 512, 1024]
+  cont_batching: [true]
+  split_mode: ["none"]
+
+benchmark:
+  n_followups: 4
+  streaming: true
+  nonstreaming: true
+
+objective: minimize_e2e_latency

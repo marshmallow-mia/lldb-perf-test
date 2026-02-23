@@ -1,0 +1,405 @@
+"""Server lifecycle management and benchmark runner for llama-bench."""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+
+from llama_bench import EXPECTED_LLAMA_SERVER_VERSION
+from llama_bench.config import BenchConfig
+from llama_bench.gpu import build_env
+from llama_bench.metrics import (
+    ClientMetrics,
+    RunMetrics,
+    classify_failure,
+    metrics_to_dict,
+    parse_server_log,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ServerHandle
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ServerHandle:
+    process: subprocess.Popen
+    stdout_path: str
+    stderr_path: str
+    pid: int
+
+
+# ---------------------------------------------------------------------------
+# start_server
+# ---------------------------------------------------------------------------
+
+def _build_server_cmd(cfg: BenchConfig) -> list[str]:
+    """Build the command-line list for launching llama-server."""
+    cmd: list[str] = []
+    if cfg.use_sudo:
+        cmd.append("sudo")
+
+    cmd += [
+        cfg.server_binary,
+        "-m", cfg.model_path,
+        "--host", cfg.host,
+        "--port", str(cfg.port),
+        "-np", str(cfg.np),
+        "-c", str(cfg.ctx),
+        "-n", "4096",
+        "--batch-size", str(cfg.batch_size),
+        "--ubatch-size", str(cfg.ubatch_size),
+        "--n-gpu-layers", str(cfg.n_gpu_layers),
+        "--cache-type-k", cfg.cache_type_k,
+        "--cache-type-v", cfg.cache_type_v,
+        "--cache-reuse", str(cfg.cache_reuse),
+        "--threads", str(cfg.threads),
+        "--threads-batch", str(cfg.threads_batch),
+        "--split-mode", cfg.split_mode,
+    ]
+
+    if cfg.flash_attn:
+        cmd += ["--flash-attn", "on"]
+    else:
+        cmd += ["--flash-attn", "off"]
+
+    if cfg.kv_unified:
+        cmd.append("--kv-unified")
+
+    if cfg.cont_batching:
+        cmd.append("--cont-batching")
+
+    return cmd
+
+
+def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHandle:
+    """Launch llama-server as a subprocess, redirecting I/O to log files.
+
+    Returns a :class:`ServerHandle` describing the running process.
+    """
+    os.makedirs(artifacts_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    stdout_path = os.path.join(artifacts_dir, f"server_stdout_{timestamp}.log")
+    stderr_path = os.path.join(artifacts_dir, f"server_stderr_{timestamp}.log")
+
+    cmd = _build_server_cmd(cfg)
+    env = build_env(cfg.vk_visible_devices)
+
+    logger.debug("Starting server: %s", " ".join(cmd))
+
+    stdout_fh = open(stdout_path, "w")
+    stderr_fh = open(stderr_path, "w")
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            env=env,
+            close_fds=True,
+        )
+    except Exception:
+        stdout_fh.close()
+        stderr_fh.close()
+        raise
+
+    return ServerHandle(
+        process=proc,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        pid=proc.pid,
+    )
+
+
+# ---------------------------------------------------------------------------
+# wait_for_server_ready
+# ---------------------------------------------------------------------------
+
+def wait_for_server_ready(host: str, port: int, timeout: float = 60.0) -> bool:
+    """Poll ``GET /health`` until 200 OK or *timeout* seconds elapse."""
+    url = f"http://{host}:{port}/health"
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        try:
+            resp = requests.get(url, timeout=2.0)
+            if resp.status_code == 200:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(1.0)
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# stop_server
+# ---------------------------------------------------------------------------
+
+def stop_server(handle: ServerHandle) -> None:
+    """Terminate the server process gracefully, force-killing if needed."""
+    proc = handle.process
+    if proc.poll() is not None:
+        return  # already exited
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("Server process %d did not die after SIGKILL", handle.pid)
+
+
+# ---------------------------------------------------------------------------
+# Version helpers
+# ---------------------------------------------------------------------------
+
+def get_server_version(binary: str, use_sudo: bool = False) -> Optional[str]:
+    """Run ``llama-server --version`` and return the version string, or None."""
+    cmd = []
+    if use_sudo:
+        cmd.append("sudo")
+    cmd += [binary, "--version"]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        output = (result.stdout + result.stderr).strip()
+        # Look for "version: b4200" or just "b4200"
+        import re
+        m = re.search(r"b\d{4,}", output)
+        if m:
+            return m.group(0)
+        # Fallback: return first non-empty line
+        for line in output.splitlines():
+            if line.strip():
+                return line.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError):
+        pass
+    return None
+
+
+def check_version_mismatch(binary: str, use_sudo: bool = False) -> Optional[str]:
+    """Return a warning message if the binary version differs from the expected version."""
+    version = get_server_version(binary, use_sudo)
+    if version is None:
+        return f"Could not determine llama-server version (binary: {binary!r})."
+    if version != EXPECTED_LLAMA_SERVER_VERSION:
+        return (
+            f"llama-server version mismatch: expected {EXPECTED_LLAMA_SERVER_VERSION!r}, "
+            f"got {version!r}. Results may differ from baseline."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# BenchmarkRunner
+# ---------------------------------------------------------------------------
+
+def _config_hash(cfg: BenchConfig) -> str:
+    import dataclasses
+    cfg_dict = dataclasses.asdict(cfg)
+    return hashlib.md5(
+        json.dumps(cfg_dict, sort_keys=True).encode()
+    ).hexdigest()[:8]
+
+
+def _make_run_id(cfg: BenchConfig) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    ch = _config_hash(cfg)
+    return f"run_{ts}_{ch}"
+
+
+class BenchmarkRunner:
+    """Orchestrate start/stop of llama-server and execution of prompts."""
+
+    def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results") -> None:
+        self.cfg = cfg
+        self.artifacts_dir = artifacts_dir
+        os.makedirs(artifacts_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run_single(
+        self,
+        prompt_sequence: list[dict],
+        n_followups: int = 4,
+    ) -> list[RunMetrics]:
+        """Start server, run *prompt_sequence*, stop server, return metrics."""
+        handle: Optional[ServerHandle] = None
+        results: list[RunMetrics] = []
+
+        try:
+            handle = start_server(self.cfg, self.artifacts_dir)
+            ready = wait_for_server_ready(self.cfg.host, self.cfg.port, timeout=90.0)
+
+            if not ready:
+                run_id = _make_run_id(self.cfg)
+                results.append(
+                    RunMetrics(
+                        success=False,
+                        failure_reason="server_crash",
+                        run_id=run_id,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        config_hash=_config_hash(self.cfg),
+                    )
+                )
+                return results
+
+            for item in prompt_sequence:
+                messages = item.get("messages", [])
+                run_id = _make_run_id(self.cfg)
+                ts = datetime.now(timezone.utc).isoformat()
+                ch = _config_hash(self.cfg)
+
+                try:
+                    # Run both streaming and non-streaming
+                    client_metrics = self._run_streaming(messages)
+                    server_metrics = self._read_server_metrics(handle)
+                    results.append(
+                        RunMetrics(
+                            server=server_metrics,
+                            client=client_metrics,
+                            success=True,
+                            run_id=run_id,
+                            timestamp=ts,
+                            config_hash=ch,
+                        )
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    reason = classify_failure(0, "", exc)
+                    results.append(
+                        RunMetrics(
+                            success=False,
+                            failure_reason=reason,
+                            run_id=run_id,
+                            timestamp=ts,
+                            config_hash=ch,
+                        )
+                    )
+        finally:
+            if handle is not None:
+                stop_server(handle)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _endpoint(self) -> str:
+        return f"http://{self.cfg.host}:{self.cfg.port}/v1/chat/completions"
+
+    def _run_streaming(
+        self,
+        messages: list[dict],
+        timeout: float = 120.0,
+    ) -> ClientMetrics:
+        """POST to /v1/chat/completions with stream=True and measure TTFT + tok/s."""
+        payload = {
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 4096,
+        }
+        start = time.monotonic()
+        ttft_ms = 0.0
+        total_tokens = 0
+        first_token = True
+
+        with requests.post(
+            self._endpoint(),
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if line.startswith("data: "):
+                    line = line[len("data: "):]
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices", [])
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        if first_token:
+                            ttft_ms = (time.monotonic() - start) * 1000
+                            first_token = False
+                        total_tokens += len(content.split())  # rough token count
+
+        end_to_end_ms = (time.monotonic() - start) * 1000
+        duration_s = end_to_end_ms / 1000.0
+        tok_per_s = total_tokens / duration_s if duration_s > 0 else 0.0
+
+        return ClientMetrics(
+            ttft_ms=ttft_ms,
+            end_to_end_latency_ms=end_to_end_ms,
+            streaming_tok_per_s=tok_per_s,
+            total_tokens=total_tokens,
+            is_streaming=True,
+        )
+
+    def _run_nonstreaming(
+        self,
+        messages: list[dict],
+        timeout: float = 120.0,
+    ) -> ClientMetrics:
+        """POST to /v1/chat/completions with stream=False and measure e2e latency."""
+        payload = {
+            "messages": messages,
+            "stream": False,
+            "max_tokens": 4096,
+        }
+        start = time.monotonic()
+        resp = requests.post(self._endpoint(), json=payload, timeout=timeout)
+        resp.raise_for_status()
+        end_to_end_ms = (time.monotonic() - start) * 1000
+
+        data = resp.json()
+        total_tokens = 0
+        try:
+            usage = data.get("usage", {})
+            total_tokens = usage.get("completion_tokens", 0)
+        except (AttributeError, KeyError):
+            pass
+
+        return ClientMetrics(
+            ttft_ms=0.0,  # not measurable without streaming
+            end_to_end_latency_ms=end_to_end_ms,
+            streaming_tok_per_s=0.0,
+            total_tokens=total_tokens,
+            is_streaming=False,
+        )
+
+    def _read_server_metrics(self, handle: ServerHandle) -> Optional[object]:
+        """Attempt to parse server metrics from the stderr log."""
+        try:
+            with open(handle.stderr_path, "r", encoding="utf-8", errors="replace") as fh:
+                log_text = fh.read()
+            return parse_server_log(log_text)
+        except OSError:
+            return None
