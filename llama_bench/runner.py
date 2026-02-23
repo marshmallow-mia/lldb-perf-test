@@ -168,7 +168,7 @@ def stop_server(handle: ServerHandle) -> None:
 # ---------------------------------------------------------------------------
 
 def get_server_version(binary: str, use_sudo: bool = False) -> Optional[str]:
-    """Run ``llama-server --version`` and return the version string, or None.
+    """Run ``llama-server --version`` and return the numeric build version, or None.
 
     The binary is always invoked directly (never with sudo) so that the version
     check does not fail with ``sudo: ./llama-server: command not found`` when
@@ -178,7 +178,7 @@ def get_server_version(binary: str, use_sudo: bool = False) -> Optional[str]:
 
         version: 8133 (2b6dfe824)
 
-    and returned as ``"8133 (2b6dfe824)"``.  If the command exits with a
+    and returned as the numeric string ``"8133"``.  If the command exits with a
     non-zero code the output is not parsed and ``None`` is returned.
 
     The *use_sudo* parameter is accepted for backward compatibility but is
@@ -196,12 +196,9 @@ def get_server_version(binary: str, use_sudo: bool = False) -> Optional[str]:
             )
             return None
         output = result.stdout + result.stderr
-        for line in output.splitlines():
-            m = re.match(r"^version:\s*(\S+)(?:\s*\(([^)]+)\))?", line.strip())
-            if m:
-                version = m.group(1)
-                build_hash = m.group(2)
-                return f"{version} ({build_hash})" if build_hash else version
+        m = re.search(r"^\s*version:\s*(\d+)\b", output, re.MULTILINE)
+        if m:
+            return m.group(1)
     except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError) as exc:
         logger.debug("get_server_version: failed to run %r: %s", binary, exc)
     return None
