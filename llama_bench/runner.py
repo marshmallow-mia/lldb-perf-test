@@ -95,6 +95,10 @@ def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHand
     cmd = _build_server_cmd(cfg)
     env = build_env(cfg.vk_visible_devices)
 
+    logger.info("Server binary: %s", cfg.server_binary)
+    logger.info("Server command: %s", " ".join(cmd))
+    logger.info("Server stdout log: %s", stdout_path)
+    logger.info("Server stderr log: %s", stderr_path)
     logger.debug("Starting server: %s", " ".join(cmd))
 
     stdout_fh = open(stdout_path, "w")  # noqa: WPS515 – kept open for the lifetime of the server process
@@ -113,6 +117,7 @@ def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHand
         stderr_fh.close()
         raise
 
+    logger.info("Server started with PID %d", proc.pid)
     return ServerHandle(
         process=proc,
         stdout_path=stdout_path,
@@ -129,16 +134,21 @@ def wait_for_server_ready(host: str, port: int, timeout: float = 60.0) -> bool:
     """Poll ``GET /health`` until 200 OK or *timeout* seconds elapse."""
     url = f"http://{host}:{port}/health"
     deadline = time.monotonic() + timeout
+    attempt = 0
 
     while time.monotonic() < deadline:
+        attempt += 1
         try:
             resp = requests.get(url, timeout=2.0)
             if resp.status_code == 200:
+                logger.info("Server ready after %d health-check attempt(s)", attempt)
                 return True
-        except requests.RequestException:
-            pass
+            logger.debug("Health check attempt %d: HTTP %d", attempt, resp.status_code)
+        except requests.RequestException as exc:
+            logger.debug("Health check attempt %d: %s", attempt, exc)
         time.sleep(1.0)
 
+    logger.warning("Server did not become ready within %.0fs (%d attempts)", timeout, attempt)
     return False
 
 
@@ -238,9 +248,11 @@ def _make_run_id(cfg: BenchConfig) -> str:
 class BenchmarkRunner:
     """Orchestrate start/stop of llama-server and execution of prompts."""
 
-    def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results") -> None:
+    def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results",
+                 log_file: Optional[str] = None) -> None:
         self.cfg = cfg
         self.artifacts_dir = artifacts_dir
+        self.log_file = log_file
         os.makedirs(artifacts_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -257,11 +269,14 @@ class BenchmarkRunner:
         results: list[RunMetrics] = []
 
         try:
+            logger.info("Starting server for run (config_hash will be assigned per-prompt)")
             handle = start_server(self.cfg, self.artifacts_dir)
+            logger.info("Waiting for server to become ready (timeout=90s)")
             ready = wait_for_server_ready(self.cfg.host, self.cfg.port, timeout=90.0)
 
             if not ready:
                 run_id = _make_run_id(self.cfg)
+                logger.warning("Server not ready; recording failure run_id=%s", run_id)
                 results.append(
                     RunMetrics(
                         success=False,
@@ -269,20 +284,38 @@ class BenchmarkRunner:
                         run_id=run_id,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         config_hash=_config_hash(self.cfg),
+                        log_file=self.log_file,
                     )
                 )
                 return results
 
-            for item in prompt_sequence:
+            for idx, item in enumerate(prompt_sequence):
                 messages = item.get("messages", [])
                 run_id = _make_run_id(self.cfg)
                 ts = datetime.now(timezone.utc).isoformat()
                 ch = _config_hash(self.cfg)
+                logger.info("Benchmark request %d/%d run_id=%s", idx + 1, len(prompt_sequence), run_id)
 
                 try:
-                    # Run both streaming and non-streaming
+                    # Run streaming request
+                    logger.debug("Starting streaming request (prompt messages=%d)", len(messages))
                     client_metrics = self._run_streaming(messages)
+                    logger.info(
+                        "Streaming done: ttft=%.1fms e2e=%.1fms tok/s=%.1f tokens=%d",
+                        client_metrics.ttft_ms,
+                        client_metrics.end_to_end_latency_ms,
+                        client_metrics.streaming_tok_per_s,
+                        client_metrics.total_tokens,
+                    )
                     server_metrics = self._read_server_metrics(handle)
+                    if server_metrics is None:
+                        logger.debug("No server metrics parsed from log (run_id=%s)", run_id)
+                    else:
+                        logger.debug(
+                            "Server metrics: prompt_tok/s=%.1f decode_tok/s=%.1f",
+                            server_metrics.prompt_tok_per_s,
+                            server_metrics.decode_tok_per_s,
+                        )
                     results.append(
                         RunMetrics(
                             server=server_metrics,
@@ -291,12 +324,14 @@ class BenchmarkRunner:
                             run_id=run_id,
                             timestamp=ts,
                             config_hash=ch,
+                            log_file=self.log_file,
                         )
                     )
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     reason = classify_failure(0, "", exc)
+                    logger.warning("Request failed run_id=%s reason=%s exc=%s", run_id, reason, exc)
                     results.append(
                         RunMetrics(
                             success=False,
@@ -304,11 +339,14 @@ class BenchmarkRunner:
                             run_id=run_id,
                             timestamp=ts,
                             config_hash=ch,
+                            log_file=self.log_file,
                         )
                     )
         finally:
             if handle is not None:
+                logger.info("Stopping server PID %d", handle.pid)
                 stop_server(handle)
+                logger.info("Server stopped; stdout=%s stderr=%s", handle.stdout_path, handle.stderr_path)
 
         return results
 
@@ -413,6 +451,17 @@ class BenchmarkRunner:
         try:
             with open(handle.stderr_path, "r", encoding="utf-8", errors="replace") as fh:
                 log_text = fh.read()
-            return parse_server_log(log_text)
-        except OSError:
+            metrics = parse_server_log(log_text)
+            if metrics is None:
+                logger.debug("Server log parse: no metrics found in %s", handle.stderr_path)
+            else:
+                logger.debug(
+                    "Server log parse: found metrics (prompt_ms=%.1f eval_ms=%.1f) in %s",
+                    metrics.prompt_eval_time_ms,
+                    metrics.eval_time_ms,
+                    handle.stderr_path,
+                )
+            return metrics
+        except OSError as exc:
+            logger.debug("Server log parse: could not read %s: %s", handle.stderr_path, exc)
             return None
