@@ -166,11 +166,11 @@ def generate_markdown_report(results: list[dict], output_path: str) -> str:
 
     content = "\n".join(lines)
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    md_path = output_path.replace(".jsonl", ".md")
-    if not md_path.endswith(".md"):
-        md_path = output_path + ".md"
-    with open(md_path, "w", encoding="utf-8") as fh:
+    abs_output = os.path.abspath(output_path)
+    parent_dir = os.path.dirname(abs_output)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    with open(abs_output, "w", encoding="utf-8") as fh:
         fh.write(content)
 
     return content

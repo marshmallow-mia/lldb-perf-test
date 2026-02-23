@@ -97,7 +97,7 @@ def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHand
 
     logger.debug("Starting server: %s", " ".join(cmd))
 
-    stdout_fh = open(stdout_path, "w")
+    stdout_fh = open(stdout_path, "w")  # noqa: WPS515 – kept open for the lifetime of the server process
     stderr_fh = open(stderr_path, "w")
 
     try:

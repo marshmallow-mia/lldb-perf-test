@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional
 
 from rich.columns import Columns
-from rich.console import Console, RenderableType
+from rich.console import Console, Group as RichGroup, RenderableType
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
@@ -146,7 +146,6 @@ class BenchTUI:
             parts.append(Panel(table, title="Results", border_style="magenta"))
 
         # Stack vertically
-        from rich.console import Group as RichGroup
         return Panel(
             RichGroup(*parts),
             title="[bold]llama-bench[/bold]",

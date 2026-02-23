@@ -110,6 +110,12 @@ CURATED_FLAGS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Cache quantisation types that are known to be incompatible with flash attention.
+# These are sub-8-bit quants that lack the precision required by FA implementations.
+_FLASH_ATTN_INCOMPATIBLE_CACHE_TYPES: frozenset[str] = frozenset(
+    {"q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}
+)
+
 
 # ---------------------------------------------------------------------------
 # parse_range
@@ -264,16 +270,13 @@ def validate_config(cfg: BenchConfig) -> list[str]:
     if cfg.n_gpu_layers < 0:
         warnings.append(f"n_gpu_layers ({cfg.n_gpu_layers}) is negative.")
 
-    # Flash attention is incompatible with non-fp16/bf16 cache types only when
-    # flash_attn is enabled and cache types are fully quantised (< 8-bit effectively)
-    incompatible_with_fa = {"q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}
     if cfg.flash_attn:
-        if cfg.cache_type_k in incompatible_with_fa:
+        if cfg.cache_type_k in _FLASH_ATTN_INCOMPATIBLE_CACHE_TYPES:
             warnings.append(
                 f"flash_attn=True may be incompatible with cache_type_k={cfg.cache_type_k!r}. "
                 "Consider using q8_0 or f16."
             )
-        if cfg.cache_type_v in incompatible_with_fa:
+        if cfg.cache_type_v in _FLASH_ATTN_INCOMPATIBLE_CACHE_TYPES:
             warnings.append(
                 f"flash_attn=True may be incompatible with cache_type_v={cfg.cache_type_v!r}. "
                 "Consider using q8_0 or f16."

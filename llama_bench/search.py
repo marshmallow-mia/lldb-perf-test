@@ -168,7 +168,7 @@ class StagedSearcher:
                         metrics=run_metrics,
                         best_score=float("inf"),
                         phase=phase,
-                        run_id=f"phase{phase}_cfg{idx}_stopped_{reason.name.lower() if reason else 'unknown'}",
+                        run_id=f"phase{phase}_cfg{idx}_stopped_{reason.name.lower() if isinstance(reason, EarlyStopReason) else 'unknown'}",
                     )
                 else:
                     if best < self._best_score:
