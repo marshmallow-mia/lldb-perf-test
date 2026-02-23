@@ -266,6 +266,33 @@ systems.
 - Never run untrusted binaries with sudo.
 - The sudo command runs the server binary directly; no shell expansion is used.
 
+### Running `llama-bench` itself under sudo
+
+`llama-bench` is installed as a console script inside the active virtual
+environment (e.g. `~/.local/share/.../venv/bin/llama-bench`).  When you invoke
+`sudo llama-bench`, sudo's restricted `PATH` will often **not** include the
+venv's `bin/` directory, causing a *"command not found"* error.
+
+**Recommended workaround — preserve PATH:**
+
+```bash
+sudo env PATH="$PATH" llama-bench bench --server /absolute/path/to/llama-server ...
+```
+
+**Alternative — system-wide symlink:**
+
+```bash
+sudo ln -s "$(which llama-bench)" /usr/local/bin/llama-bench
+```
+
+After creating the symlink, plain `sudo llama-bench ...` works without the
+`env PATH=...` wrapper.
+
+**Best practice:** only the `llama-server` binary needs elevated privileges.
+`llama-bench` itself does not need to run as root; use `--sudo` (the default)
+so only the server subprocess is elevated, and invoke `llama-bench` as your
+regular user.
+
 ---
 
 ## Version Compatibility
@@ -273,12 +300,26 @@ systems.
 The tool is tested against llama.cpp build **b4200** (`EXPECTED_LLAMA_SERVER_VERSION`
 in `llama_bench/__init__.py`).
 
-If your binary reports a different version, a warning is printed:
+Version detection runs `llama-server --version` **without** sudo and parses a
+line of the form:
 
 ```
-Version warning: llama-server version mismatch: expected 'b4200', got 'b4350'. 
+version: 8133 (2b6dfe824)
+```
+
+The parsed version string (e.g. `"8133 (2b6dfe824)"`) is compared against
+`EXPECTED_LLAMA_SERVER_VERSION`.  If they differ, a warning is printed:
+
+```
+Version warning: llama-server version mismatch: expected 'b4200', got '8133 (2b6dfe824)'.
 Results may differ from baseline.
 ```
 
-The benchmark will still run; the warning is informational only.
-To suppress it, update `EXPECTED_LLAMA_SERVER_VERSION` to your build tag.
+The `--server` path is **always resolved to an absolute path** before version
+detection runs, so `sudo: ./llama-server: command not found` errors can never
+be mis-parsed as a version string.
+
+To suppress the warning, update `EXPECTED_LLAMA_SERVER_VERSION` to match your
+build (e.g. `"8133 (2b6dfe824)"`).
+
+The benchmark will still run regardless; the warning is informational only.

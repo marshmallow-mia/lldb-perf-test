@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -36,7 +37,48 @@ def _discover_and_print_gpus() -> str:
     return default_vk_devices(gpus)
 
 
-def _check_version(server: str, use_sudo: bool) -> None:
+def _resolve_server_path(server: str) -> str:
+    """Resolve *server* to an absolute path and validate it.
+
+    Handles:
+
+    * ``~`` expansion (``~/bin/llama-server`` → ``/home/user/bin/llama-server``)
+    * relative paths (``./llama-server`` → ``/cwd/llama-server``)
+    * bare names on PATH (``llama-server`` → ``/venv/bin/llama-server``)
+
+    Exits with a clear error message if the binary is not found or not
+    executable.
+    """
+    path = os.path.expanduser(server)
+    if not os.path.isabs(path):
+        # Try resolving as a relative path first
+        candidate = os.path.abspath(path)
+        if os.path.isfile(candidate):
+            path = candidate
+        else:
+            # Fall back to PATH lookup for bare names (e.g. "llama-server")
+            resolved = shutil.which(server)
+            if resolved:
+                path = resolved
+            else:
+                path = candidate  # keep absolute path so error message is clear
+
+    if not os.path.isfile(path):
+        console.print(f"[red]Error:[/] llama-server binary not found: {path!r}")
+        console.print(
+            "[yellow]Tip:[/] Provide an absolute path, e.g. "
+            "--server /usr/local/bin/llama-server"
+        )
+        sys.exit(1)
+
+    if not os.access(path, os.X_OK):
+        console.print(f"[red]Error:[/] llama-server binary is not executable: {path!r}")
+        sys.exit(1)
+
+    return path
+
+
+def _check_version(server: str, use_sudo: bool = False) -> None:
     from llama_bench.runner import check_version_mismatch
     warning = check_version_mismatch(server, use_sudo)
     if warning:
@@ -113,6 +155,8 @@ def bench(
     from llama_bench.prompts import build_prompt_sequence, load_prompt_pack
     from llama_bench.report import print_summary_table
     from llama_bench.runner import BenchmarkRunner
+
+    server = _resolve_server_path(server)
 
     if vk_devices is None:
         vk_devices = _discover_and_print_gpus()
@@ -224,6 +268,8 @@ def search(
         parse_range,
     )
     from llama_bench.search import StagedSearcher, save_results
+
+    server = _resolve_server_path(server)
 
     if vk_devices is None:
         vk_devices = _discover_and_print_gpus()
