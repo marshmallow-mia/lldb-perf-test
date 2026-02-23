@@ -1,6 +1,7 @@
 """Click CLI entry points for llama-bench."""
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sys
@@ -11,6 +12,7 @@ import click
 from rich.console import Console
 
 console = Console(stderr=True)
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +77,19 @@ def _resolve_server_path(server: str) -> str:
         console.print(f"[red]Error:[/] llama-server binary is not executable: {path!r}")
         sys.exit(1)
 
+    logger.info("Resolved server path: %s", path)
     return path
 
 
 def _check_version(server: str, use_sudo: bool = False) -> None:
     from llama_bench.runner import check_version_mismatch
+    logger.info("Running version check for %s", server)
     warning = check_version_mismatch(server, use_sudo)
     if warning:
+        logger.info("Version check result: %s", warning)
         console.print(f"[yellow]Version warning:[/] {warning}")
+    else:
+        logger.info("Version check passed")
 
 
 def _print_validation(cfg) -> None:
@@ -143,11 +150,13 @@ def main() -> None:
 @click.option("--prompt-pack", default=None, type=click.Path(exists=True),
               help="Path to a custom prompt pack (JSON/YAML).")
 @click.option("--no-tui", is_flag=True, default=False, help="Disable TUI, use plain output.")
+@click.option("-v", "--verbose", "verbosity", count=True,
+              help="Verbose output; use -vv for debug-level logging.")
 def bench(
     server, model, host, port, np, ctx, n_gpu_layers, flash_attn,
     batch_size, ubatch_size, cache_type_k, cache_type_v, kv_unified,
     cache_reuse, cont_batching, threads, threads_batch, split_mode,
-    vk_devices, sudo, n_followups, output, prompt_pack, no_tui,
+    vk_devices, sudo, n_followups, output, prompt_pack, no_tui, verbosity,
 ) -> None:
     """Run a single benchmark configuration."""
     from llama_bench.config import configs_from_args
@@ -155,6 +164,13 @@ def bench(
     from llama_bench.prompts import build_prompt_sequence, load_prompt_pack
     from llama_bench.report import print_summary_table
     from llama_bench.runner import BenchmarkRunner
+    from llama_bench.logging_setup import setup_logging
+
+    output_path = output or _default_output()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    log_file = setup_logging(verbosity, os.path.dirname(os.path.abspath(output_path)))
+    if log_file:
+        console.print(f"[dim]Verbose log: {log_file}[/]")
 
     server = _resolve_server_path(server)
 
@@ -180,10 +196,8 @@ def bench(
     else:
         prompt_seq = build_prompt_sequence(n_followups=n_followups)
 
-    output_path = output or _default_output()
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-    runner = BenchmarkRunner(cfg, artifacts_dir=os.path.dirname(os.path.abspath(output_path)))
+    runner = BenchmarkRunner(cfg, artifacts_dir=os.path.dirname(os.path.abspath(output_path)),
+                             log_file=log_file)
 
     console.print(f"[bold]Running benchmark[/] → {output_path}")
 
@@ -253,12 +267,14 @@ def bench(
 @click.option("--output", "-o", default=None,
               help="JSONL output path.")
 @click.option("--no-tui", is_flag=True, default=False, help="Disable TUI.")
+@click.option("-v", "--verbose", "verbosity", count=True,
+              help="Verbose output; use -vv for debug-level logging.")
 def search(
     server, model, host, port, np, ctx, n_gpu_layers, flash_attn,
     batch_size, ubatch_size, cache_type_k, cache_type_v, kv_unified,
     cache_reuse, cont_batching, threads, threads_batch, split_mode,
     vk_devices, sudo,
-    np_tests, ctx_tests, ngl_tests, max_configs, output, no_tui,
+    np_tests, ctx_tests, ngl_tests, max_configs, output, no_tui, verbosity,
 ) -> None:
     """Run a staged parameter search over the search space."""
     from llama_bench.config import (
@@ -268,6 +284,13 @@ def search(
         parse_range,
     )
     from llama_bench.search import StagedSearcher, save_results
+    from llama_bench.logging_setup import setup_logging
+
+    output_path = output or _default_output()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    log_file = setup_logging(verbosity, os.path.dirname(os.path.abspath(output_path)))
+    if log_file:
+        console.print(f"[dim]Verbose log: {log_file}[/]")
 
     server = _resolve_server_path(server)
 
@@ -296,9 +319,6 @@ def search(
         console.print(f"[red]Invalid range spec:[/] {exc}")
         sys.exit(1)
 
-    output_path = output or _default_output()
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
     def _progress_cb(current: int, total: int, phase: int, phase_name: str) -> None:
         console.print(f"[dim]Phase {phase} ({phase_name}): {current}/{total}[/]")
 
@@ -309,6 +329,7 @@ def search(
             artifacts_dir=os.path.dirname(os.path.abspath(output_path)),
             max_configs=max_configs,
             progress_cb=_progress_cb,
+            log_file=log_file,
         )
         results = searcher.run()
     else:
@@ -323,6 +344,7 @@ def search(
                 artifacts_dir=os.path.dirname(os.path.abspath(output_path)),
                 max_configs=max_configs,
                 progress_cb=_tui_cb,
+                log_file=log_file,
             )
             results = searcher.run()
 

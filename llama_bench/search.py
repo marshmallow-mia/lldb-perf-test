@@ -56,6 +56,7 @@ class StagedSearcher:
         max_configs: int = 50,
         timeout_factor: float = 3.0,
         progress_cb: Optional[Callable[[int, int, int, str], None]] = None,
+        log_file: Optional[str] = None,
     ) -> None:
         self.space = space
         self.base_cfg = base_cfg
@@ -63,6 +64,7 @@ class StagedSearcher:
         self.max_configs = max_configs
         self.timeout_factor = timeout_factor
         self.progress_cb = progress_cb
+        self.log_file = log_file
 
         self._results: list[SearchResult] = []
         self._best_score: float = float("inf")
@@ -135,7 +137,8 @@ class StagedSearcher:
                 self.progress_cb(idx, total, phase, phase_name)
 
             prompt_seq = build_prompt_sequence(n_followups=n_followups)
-            runner = BenchmarkRunner(cfg, artifacts_dir=self.artifacts_dir)
+            runner = BenchmarkRunner(cfg, artifacts_dir=self.artifacts_dir,
+                                     log_file=self.log_file)
 
             run_start = time.monotonic()
             try:
@@ -247,6 +250,7 @@ def save_results(results: list[SearchResult], output_file: str) -> None:
                         "failure_reason": m.failure_reason,
                         "timestamp": m.timestamp,
                         "config_hash": m.config_hash,
+                        "log_file": m.log_file,
                         "client": {
                             "ttft_ms": m.client.ttft_ms,
                             "end_to_end_latency_ms": m.client.end_to_end_latency_ms,

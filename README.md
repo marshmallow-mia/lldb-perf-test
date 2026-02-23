@@ -100,6 +100,41 @@ llama-bench search \
   --max-configs 30
 ```
 
+### Run with verbose logging (no TUI)
+
+Use `-v` for INFO-level logs and `-vv` for DEBUG-level logs.  Both are written
+to stderr **and** to a timestamped log file under `results/`:
+
+```bash
+# INFO-level verbose, plain output (no TUI)
+llama-bench search \
+  -v --no-tui \
+  --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --server /opt/llama.cpp/llama-server
+
+# DEBUG-level verbose, plain output
+llama-bench search \
+  -vv --no-tui \
+  --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --server /opt/llama.cpp/llama-server
+
+# DEBUG-level verbose with TUI (logs go to file only; TUI is shown in terminal)
+llama-bench search \
+  -vv \
+  --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --server /opt/llama.cpp/llama-server
+```
+
+Verbose logs include:
+- Resolved server binary path
+- Version check result
+- Server start command, PID, and log file paths
+- Health-check polling progress
+- Each benchmark request with TTFT, end-to-end latency, and tok/s
+- Server log parsing summary
+
+The log file path is also recorded in each JSONL result entry as `log_file`.
+
 ### Generate a report
 
 ```bash
@@ -140,6 +175,7 @@ Run a benchmark with a single configuration.
 | `--output`, `-o` | auto | JSONL output path |
 | `--prompt-pack` | — | Custom prompt pack file (JSON/YAML) |
 | `--no-tui` | `False` | Disable TUI, use plain output |
+| `-v` / `--verbose` | off | Verbose logs to stderr + file (`-vv` for debug) |
 
 ### `llama-bench search`
 
@@ -151,6 +187,8 @@ All flags from `bench`, plus:
 | `--ctx-tests` | `49152` | Range spec for `-c` |
 | `--ngl-tests` | `45` | Range spec for `--n-gpu-layers` |
 | `--max-configs` | `50` | Maximum configs to evaluate |
+| `--no-tui` | `False` | Disable TUI |
+| `-v` / `--verbose` | off | Verbose logs to stderr + file (`-vv` for debug) |
 
 Range specs accept:
 - `"1-4"` → `[1, 2, 3, 4]`
@@ -230,6 +268,7 @@ Results are saved as **JSONL** (one JSON object per line).  Each line contains:
   "config_hash": "abcd1234",
   "success": true,
   "failure_reason": null,
+  "log_file": "results/llama_bench_20240101T120000.log",
   "client": {
     "ttft_ms": 142.3,
     "end_to_end_latency_ms": 8450.1,

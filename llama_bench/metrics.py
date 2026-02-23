@@ -42,6 +42,7 @@ class RunMetrics:
     run_id: str = ""
     timestamp: str = ""
     config_hash: str = ""
+    log_file: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +217,7 @@ def metrics_to_dict(m: RunMetrics) -> dict:
         "config_hash": m.config_hash,
         "success": m.success,
         "failure_reason": m.failure_reason,
+        "log_file": m.log_file,
         "client": {
             "ttft_ms": m.client.ttft_ms,
             "end_to_end_latency_ms": m.client.end_to_end_latency_ms,
