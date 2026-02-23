@@ -223,6 +223,21 @@ def bench(
 
     console.print(f"[green]Results saved to[/] {output_path}")
 
+    # Fail fast for startup errors in bench mode (model not found / OOM VRAM).
+    _STARTUP_FAILURE_REASONS = {"model_not_found", "out_of_vram", "server_exited", "server_startup_timeout"}
+    if run_metrics and not run_metrics[0].success and run_metrics[0].failure_reason in _STARTUP_FAILURE_REASONS:
+        import textwrap
+        m = run_metrics[0]
+        stderr_hint = f"\n  Server stderr log: {m.stderr_path}" if m.stderr_path else ""
+        if m.server_error_excerpt:
+            indented = textwrap.indent(m.server_error_excerpt, "    ")
+            excerpt_hint = f"\n  Excerpt:\n{indented}"
+        else:
+            excerpt_hint = ""
+        raise click.ClickException(
+            f"Server startup failed ({m.failure_reason}).{stderr_hint}{excerpt_hint}"
+        )
+
     # Print summary
     from llama_bench.report import load_results
     loaded = load_results(output_path)

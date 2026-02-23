@@ -362,3 +362,67 @@ To suppress the warning, update `EXPECTED_LLAMA_SERVER_VERSION` to match your
 build number (e.g. `"9000"`).
 
 The benchmark will still run regardless; the warning is informational only.
+
+---
+
+## Troubleshooting: Server Startup Failures
+
+`llama-bench` classifies server startup failures into four categories and
+surfaces them in both `bench` and `search` modes.
+
+### Failure types
+
+| `failure_reason` | Meaning | Common cause |
+|---|---|---|
+| `model_not_found` | llama-server could not open the model file | Wrong `--model` path, typo, or the file was deleted |
+| `out_of_vram` | GPU memory allocation failed | Too many layers offloaded (`--n-gpu-layers`), model too large for VRAM |
+| `server_exited` | Server process exited before `/health` returned 200, with no recognised stderr pattern | Misconfigured flags, missing shared libraries |
+| `server_startup_timeout` | Server did not respond to `/health` within 90 seconds | Very large model, slow disk I/O, system under heavy load |
+
+### How failures are detected
+
+When a server startup failure occurs `llama-bench`:
+
+1. Polls `GET /health` once per second and simultaneously checks whether the
+   server process is still alive.
+2. If the process exits early, polling stops immediately (no repeated connection
+   attempts against a dead process).
+3. Reads the tail of the server stderr log and matches it against known error
+   patterns to produce a structured `failure_reason`.
+4. Stores the `stderr_path`, `stdout_path`, and a short `server_error_excerpt`
+   in the JSONL result record for inspection.
+
+### `bench` mode behaviour
+
+If the server fails to start, `llama-bench bench` exits with a non-zero code
+and prints an actionable error, e.g.:
+
+```
+Error: Server startup failed (model_not_found).
+  Server stderr log: results/server_stderr_20260101T120000.log
+  Excerpt:
+    gguf_init_from_file: failed to open GGUF file /bad/path.gguf (No such file or directory)
+```
+
+The JSONL result file is still written so you can inspect it later.
+
+### `search` mode behaviour
+
+In search mode startup failures are treated as expected outcomes: the failing
+configuration is marked `success=false` with the appropriate `failure_reason`,
+and the search continues with the next configuration.  This means that an OOM
+failure at high `--n-gpu-layers` values will not abort the whole search.
+
+### Practical tips
+
+* **`model_not_found`** — pass an absolute path to `--model` and verify the
+  file exists: `ls -lh /path/to/model.gguf`.
+* **`out_of_vram`** — reduce `--n-gpu-layers` (or let `search` discover the
+  maximum that fits).  Check free VRAM with `vulkaninfo | grep -i memory`.
+* **`server_exited`** — inspect the full stderr log printed in the error
+  message for clues.  Common culprits: wrong binary for the hardware (e.g.
+  CUDA binary on a Vulkan-only machine), missing Vulkan ICD.
+* **`server_startup_timeout`** — the model may be loading from a slow storage
+  device.  The startup timeout is currently fixed at 90 seconds; if your
+  hardware is particularly slow, consider using a smaller model or faster
+  storage.

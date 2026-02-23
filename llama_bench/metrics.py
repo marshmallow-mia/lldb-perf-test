@@ -43,6 +43,9 @@ class RunMetrics:
     timestamp: str = ""
     config_hash: str = ""
     log_file: Optional[str] = None
+    stderr_path: Optional[str] = None
+    stdout_path: Optional[str] = None
+    server_error_excerpt: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,53 @@ def parse_server_log(log_text: str) -> Optional[ServerMetrics]:
 
 
 # ---------------------------------------------------------------------------
+# classify_server_stderr / extract_server_error_excerpt
+# ---------------------------------------------------------------------------
+
+# Ordered list of (reason, pattern) pairs; first match wins.
+_STARTUP_FAILURE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("model_not_found", re.compile(
+        r"gguf_init_from_file: failed to open"
+        r"|srv\s+load_model: failed to load model"
+        r"|common_init_from_params: failed to load model"
+        r"|llama_model_load: error loading model",
+        re.IGNORECASE,
+    )),
+    ("out_of_vram", re.compile(
+        r"ggml_vulkan: Device memory allocation of size .* failed"
+        r"|vk::Device::allocateMemory: ErrorOutOfDeviceMemory"
+        r"|(?:failed|unable) to allocate Vulkan\d+ buffer"
+        r"|main: exiting due to model loading error",
+        re.IGNORECASE,
+    )),
+]
+
+
+def classify_server_stderr(stderr_text: str) -> str:
+    """Classify a server startup failure from stderr text.
+
+    Returns one of ``"model_not_found"``, ``"out_of_vram"``, or
+    ``"server_exited"`` (fallback when no specific pattern matches).
+    """
+    for reason, pattern in _STARTUP_FAILURE_PATTERNS:
+        if pattern.search(stderr_text):
+            return reason
+    return "server_exited"
+
+
+def extract_server_error_excerpt(stderr_text: str, max_lines: int = 5) -> str:
+    """Return a short excerpt of error/fatal lines from server stderr.
+
+    Falls back to the last *max_lines* lines if no error lines are found.
+    """
+    _ERROR_KEYWORDS = ("error", "failed", "fatal", "abort", "oom", "vulkan")
+    lines = stderr_text.splitlines()
+    error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in _ERROR_KEYWORDS)]
+    excerpt = error_lines[-max_lines:] if error_lines else lines[-max_lines:]
+    return "\n".join(excerpt)
+
+
+# ---------------------------------------------------------------------------
 # classify_failure
 # ---------------------------------------------------------------------------
 
@@ -218,6 +268,9 @@ def metrics_to_dict(m: RunMetrics) -> dict:
         "success": m.success,
         "failure_reason": m.failure_reason,
         "log_file": m.log_file,
+        "stderr_path": m.stderr_path,
+        "stdout_path": m.stdout_path,
+        "server_error_excerpt": m.server_error_excerpt,
         "client": {
             "ttft_ms": m.client.ttft_ms,
             "end_to_end_latency_ms": m.client.end_to_end_latency_ms,

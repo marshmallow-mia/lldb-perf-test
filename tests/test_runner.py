@@ -200,3 +200,60 @@ class TestResolveServerPath:
         fn = self._get_fn()
         with pytest.raises(SystemExit):
             fn(str(binary))
+
+
+# ---------------------------------------------------------------------------
+# wait_for_server_ready — liveness checks
+# ---------------------------------------------------------------------------
+
+class TestWaitForServerReady:
+    """Unit tests for wait_for_server_ready with process liveness checking."""
+
+    def _fn(self):
+        from llama_bench.runner import wait_for_server_ready
+        return wait_for_server_ready
+
+    def test_returns_none_when_health_check_succeeds(self):
+        """Returns None (success) when /health responds 200 immediately."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch("requests.get", return_value=mock_resp):
+            result = self._fn()("localhost", 5001, timeout=5.0)
+        assert result is None
+
+    def test_returns_server_startup_timeout_on_timeout(self):
+        """Returns 'server_startup_timeout' if server never responds within timeout."""
+        import requests as req
+        with patch("requests.get", side_effect=req.ConnectionError("refused")):
+            with patch("time.sleep"):  # skip actual sleeps
+                result = self._fn()("localhost", 5001, timeout=0.01)
+        assert result == "server_startup_timeout"
+
+    def test_returns_server_exited_when_process_exits_early(self):
+        """Returns 'server_exited' immediately if proc.poll() returns non-None."""
+        import requests as req
+        proc = MagicMock()
+        proc.poll.return_value = 1  # process already exited
+        proc.returncode = 1
+        with patch("requests.get", side_effect=req.ConnectionError("refused")):
+            result = self._fn()("localhost", 5001, timeout=30.0, proc=proc)
+        assert result == "server_exited"
+
+    def test_returns_none_when_process_alive_and_health_ok(self):
+        """Returns None when proc is alive and /health eventually returns 200."""
+        proc = MagicMock()
+        proc.poll.return_value = None  # still running
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch("requests.get", return_value=mock_resp):
+            result = self._fn()("localhost", 5001, timeout=30.0, proc=proc)
+        assert result is None
+
+    def test_no_proc_argument_still_works(self):
+        """Backward-compatible: omitting proc returns None on successful health check."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch("requests.get", return_value=mock_resp):
+            result = self._fn()("localhost", 5001, timeout=5.0)
+        assert result is None
