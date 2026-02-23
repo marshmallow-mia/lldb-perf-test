@@ -5,6 +5,8 @@ from llama_bench.metrics import (
     ClientMetrics,
     RunMetrics,
     classify_failure,
+    classify_server_stderr,
+    extract_server_error_excerpt,
     parse_server_log,
     score_run,
 )
@@ -140,3 +142,79 @@ def test_score_run_success():
 def test_score_run_failure():
     m = RunMetrics(success=False, failure_reason="timeout")
     assert score_run(m) == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# classify_server_stderr
+# ---------------------------------------------------------------------------
+
+# Fixture lines from problem statement
+_MODEL_NOT_FOUND_LINES = [
+    "gguf_init_from_file: failed to open GGUF file /path/to/model.gguf (No such file or directory)",
+    "srv    load_model: failed to load model, '/path/to/model.gguf'",
+    "common_init_from_params: failed to load model '/path/to/model.gguf'",
+    "llama_model_load: error loading model:",
+]
+
+_OUT_OF_VRAM_LINES = [
+    "ggml_vulkan: Device memory allocation of size 1234567890 failed.",
+    "vk::Device::allocateMemory: ErrorOutOfDeviceMemory",
+    "failed to allocate Vulkan0 buffer",
+    "unable to allocate Vulkan0 buffer",
+    "main: exiting due to model loading error",
+]
+
+
+class TestClassifyServerStderr:
+    """Unit tests for classify_server_stderr using problem-statement fixtures."""
+
+    @pytest.mark.parametrize("line", _MODEL_NOT_FOUND_LINES)
+    def test_model_not_found(self, line):
+        assert classify_server_stderr(line) == "model_not_found"
+
+    @pytest.mark.parametrize("line", _OUT_OF_VRAM_LINES)
+    def test_out_of_vram(self, line):
+        assert classify_server_stderr(line) == "out_of_vram"
+
+    def test_unknown_stderr_returns_server_exited(self):
+        assert classify_server_stderr("some unrecognised log line") == "server_exited"
+
+    def test_empty_stderr_returns_server_exited(self):
+        assert classify_server_stderr("") == "server_exited"
+
+    def test_model_not_found_takes_priority_over_model_loading_error(self):
+        # Both patterns present; model_not_found should win (listed first)
+        text = (
+            "gguf_init_from_file: failed to open GGUF file x.gguf (No such file or directory)\n"
+            "main: exiting due to model loading error\n"
+        )
+        assert classify_server_stderr(text) == "model_not_found"
+
+    def test_multiline_oom_log(self):
+        log = (
+            "ggml_vulkan: initialising...\n"
+            "ggml_vulkan: Device memory allocation of size 4294967296 failed.\n"
+            "vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n"
+        )
+        assert classify_server_stderr(log) == "out_of_vram"
+
+
+# ---------------------------------------------------------------------------
+# extract_server_error_excerpt
+# ---------------------------------------------------------------------------
+
+class TestExtractServerErrorExcerpt:
+    def test_picks_error_lines(self):
+        log = "INFO: starting\nERROR: something failed\nDEBUG: done\n"
+        excerpt = extract_server_error_excerpt(log)
+        assert "ERROR: something failed" in excerpt
+
+    def test_falls_back_to_last_lines_when_no_error(self):
+        log = "line1\nline2\nline3\nline4\nline5\nline6\n"
+        excerpt = extract_server_error_excerpt(log, max_lines=3)
+        lines = excerpt.splitlines()
+        assert len(lines) <= 3
+        assert "line6" in excerpt
+
+    def test_empty_text_returns_empty(self):
+        assert extract_server_error_excerpt("") == ""

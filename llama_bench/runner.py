@@ -20,6 +20,8 @@ from llama_bench.metrics import (
     ClientMetrics,
     RunMetrics,
     classify_failure,
+    classify_server_stderr,
+    extract_server_error_excerpt,
     metrics_to_dict,
     parse_server_log,
 )
@@ -130,26 +132,43 @@ def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHand
 # wait_for_server_ready
 # ---------------------------------------------------------------------------
 
-def wait_for_server_ready(host: str, port: int, timeout: float = 60.0) -> bool:
-    """Poll ``GET /health`` until 200 OK or *timeout* seconds elapse."""
+def wait_for_server_ready(
+    host: str,
+    port: int,
+    timeout: float = 60.0,
+    proc: Optional[subprocess.Popen] = None,
+) -> Optional[str]:
+    """Poll ``GET /health`` until 200 OK or *timeout* seconds elapse.
+
+    If *proc* is provided its liveness is checked on every iteration; if the
+    process has already exited the loop is aborted early.
+
+    Returns ``None`` on success, or a short failure-reason string on failure:
+    ``"server_exited"`` (early process exit) or ``"server_startup_timeout"``.
+    """
     url = f"http://{host}:{port}/health"
     deadline = time.monotonic() + timeout
     attempt = 0
 
     while time.monotonic() < deadline:
+        # Check if the process died before we could connect.
+        if proc is not None and proc.poll() is not None:
+            logger.warning("Server process exited (rc=%d) during readiness wait", proc.returncode)
+            return "server_exited"
+
         attempt += 1
         try:
             resp = requests.get(url, timeout=2.0)
             if resp.status_code == 200:
                 logger.info("Server ready after %d health-check attempt(s)", attempt)
-                return True
+                return None
             logger.debug("Health check attempt %d: HTTP %d", attempt, resp.status_code)
         except requests.RequestException as exc:
             logger.debug("Health check attempt %d: %s", attempt, exc)
         time.sleep(1.0)
 
     logger.warning("Server did not become ready within %.0fs (%d attempts)", timeout, attempt)
-    return False
+    return "server_startup_timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -272,15 +291,30 @@ class BenchmarkRunner:
             logger.info("Starting server for run (config_hash will be assigned per-prompt)")
             handle = start_server(self.cfg, self.artifacts_dir)
             logger.info("Waiting for server to become ready (timeout=90s)")
-            ready = wait_for_server_ready(self.cfg.host, self.cfg.port, timeout=90.0)
+            startup_failure = wait_for_server_ready(
+                self.cfg.host, self.cfg.port, timeout=90.0, proc=handle.process
+            )
 
-            if not ready:
+            if startup_failure is not None:
                 run_id = _make_run_id(self.cfg)
-                logger.warning("Server not ready; recording failure run_id=%s", run_id)
+                logger.warning("Server not ready; recording failure run_id=%s reason=%s", run_id, startup_failure)
+                stderr_text = ""
+                try:
+                    with open(handle.stderr_path, "r", encoding="utf-8", errors="replace") as fh:
+                        stderr_text = fh.read()
+                except OSError:
+                    pass
+                # For early exit, refine the reason using stderr content
+                if startup_failure == "server_exited":
+                    startup_failure = classify_server_stderr(stderr_text)
+                excerpt = extract_server_error_excerpt(stderr_text) if stderr_text else None
                 results.append(
                     RunMetrics(
                         success=False,
-                        failure_reason="server_crash",
+                        failure_reason=startup_failure,
+                        server_error_excerpt=excerpt,
+                        stderr_path=handle.stderr_path,
+                        stdout_path=handle.stdout_path,
                         run_id=run_id,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         config_hash=_config_hash(self.cfg),
