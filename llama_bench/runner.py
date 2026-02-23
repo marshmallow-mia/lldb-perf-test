@@ -168,32 +168,48 @@ def stop_server(handle: ServerHandle) -> None:
 # ---------------------------------------------------------------------------
 
 def get_server_version(binary: str, use_sudo: bool = False) -> Optional[str]:
-    """Run ``llama-server --version`` and return the version string, or None."""
-    cmd = []
-    if use_sudo:
-        cmd.append("sudo")
-    cmd += [binary, "--version"]
+    """Run ``llama-server --version`` and return the version string, or None.
+
+    The binary is always invoked directly (never with sudo) so that the version
+    check does not fail with ``sudo: ./llama-server: command not found`` when
+    sudo has a restricted PATH.
+
+    The version is extracted from a line of the form::
+
+        version: 8133 (2b6dfe824)
+
+    and returned as ``"8133 (2b6dfe824)"``.  If the command exits with a
+    non-zero code the output is not parsed and ``None`` is returned.
+
+    The *use_sudo* parameter is accepted for backward compatibility but is
+    ignored; version detection never uses sudo.
+    """
+    import re
+    cmd = [binary, "--version"]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        output = (result.stdout + result.stderr).strip()
-        # Look for "version: b4200" or just "b4200"
-        import re
-        m = re.search(r"b\d{4,}", output)
-        if m:
-            return m.group(0)
-        # Fallback: return first non-empty line
+        if result.returncode != 0:
+            logger.debug(
+                "get_server_version: non-zero exit %d for %r; stderr=%r",
+                result.returncode, binary, result.stderr[:200],
+            )
+            return None
+        output = result.stdout + result.stderr
         for line in output.splitlines():
-            if line.strip():
-                return line.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError):
-        pass
+            m = re.match(r"^version:\s*(\S+)(?:\s*\(([^)]+)\))?", line.strip())
+            if m:
+                version = m.group(1)
+                build_hash = m.group(2)
+                return f"{version} ({build_hash})" if build_hash else version
+    except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError) as exc:
+        logger.debug("get_server_version: failed to run %r: %s", binary, exc)
     return None
 
 
 def check_version_mismatch(binary: str, use_sudo: bool = False) -> Optional[str]:
     """Return a warning message if the binary version differs from the expected version."""
-    version = get_server_version(binary, use_sudo)
+    version = get_server_version(binary)
     if version is None:
         return f"Could not determine llama-server version (binary: {binary!r})."
     if version != EXPECTED_LLAMA_SERVER_VERSION:
