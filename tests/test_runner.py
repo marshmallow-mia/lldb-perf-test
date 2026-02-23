@@ -43,26 +43,26 @@ class TestGetServerVersionParsing:
     """Unit tests for version string parsing in get_server_version."""
 
     def test_parses_version_with_hash_from_fixture(self):
-        """Parses 'version: 8133 (2b6dfe824)' from multiline fixture output."""
+        """Parses numeric version '8133' from multiline fixture output."""
         output = _fixture("llama_server_version.txt")
         result = _make_version_result(stdout=output)
         with patch("subprocess.run", return_value=result):
             version = get_server_version("/fake/llama-server")
-        assert version == "8133 (2b6dfe824)"
+        assert version == "8133"
 
     def test_parses_version_stdout_only(self):
         stdout = "version: 8133 (2b6dfe824)\n"
         result = _make_version_result(stdout=stdout)
         with patch("subprocess.run", return_value=result):
             version = get_server_version("/fake/llama-server")
-        assert version == "8133 (2b6dfe824)"
+        assert version == "8133"
 
     def test_parses_version_stderr_only(self):
         stderr = "version: 4200 (abc1234)\n"
         result = _make_version_result(stderr=stderr)
         with patch("subprocess.run", return_value=result):
             version = get_server_version("/fake/llama-server")
-        assert version == "4200 (abc1234)"
+        assert version == "4200"
 
     def test_parses_version_without_hash(self):
         """Version line without a hash component is returned as plain number."""
@@ -111,7 +111,7 @@ class TestGetServerVersionParsing:
         result = _make_version_result(stdout=stdout)
         with patch("subprocess.run", return_value=result):
             version = get_server_version("/fake/llama-server")
-        assert version == "9000 (deadbeef)"
+        assert version == "9000"
 
     def test_invoked_without_sudo(self):
         """get_server_version must never prepend 'sudo' to the command."""
@@ -134,7 +134,7 @@ class TestGetServerVersionParsing:
         result = _make_version_result(stdout=stdout)
         with patch("subprocess.run", return_value=result):
             version = get_server_version("/fake/llama-server")
-        assert version == "8133 (2b6dfe824)"
+        assert version == "8133"
 
 
 # ---------------------------------------------------------------------------

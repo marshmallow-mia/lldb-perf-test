@@ -297,7 +297,7 @@ regular user.
 
 ## Version Compatibility
 
-The tool is tested against llama.cpp build **b4200** (`EXPECTED_LLAMA_SERVER_VERSION`
+The tool is tested against llama.cpp build **8133** (`EXPECTED_LLAMA_SERVER_VERSION`
 in `llama_bench/__init__.py`).
 
 Version detection runs `llama-server --version` **without** sudo and parses a
@@ -307,11 +307,11 @@ line of the form:
 version: 8133 (2b6dfe824)
 ```
 
-The parsed version string (e.g. `"8133 (2b6dfe824)"`) is compared against
+Only the **numeric build number** (e.g. `"8133"`) is extracted and compared against
 `EXPECTED_LLAMA_SERVER_VERSION`.  If they differ, a warning is printed:
 
 ```
-Version warning: llama-server version mismatch: expected 'b4200', got '8133 (2b6dfe824)'.
+Version warning: llama-server version mismatch: expected '8133', got '9000'.
 Results may differ from baseline.
 ```
 
@@ -320,6 +320,6 @@ detection runs, so `sudo: ./llama-server: command not found` errors can never
 be mis-parsed as a version string.
 
 To suppress the warning, update `EXPECTED_LLAMA_SERVER_VERSION` to match your
-build (e.g. `"8133 (2b6dfe824)"`).
+build number (e.g. `"9000"`).
 
 The benchmark will still run regardless; the warning is informational only.
