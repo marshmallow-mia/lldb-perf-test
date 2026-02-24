@@ -46,6 +46,7 @@ class RunMetrics:
     stderr_path: Optional[str] = None
     stdout_path: Optional[str] = None
     server_error_excerpt: Optional[str] = None
+    engine_mismatch: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -302,3 +303,24 @@ def metrics_to_dict(m: RunMetrics) -> dict:
         },
         "server": server_dict,
     }
+
+
+# ---------------------------------------------------------------------------
+# detect_vulkan_used
+# ---------------------------------------------------------------------------
+
+# Lines emitted by llama.cpp when the Vulkan backend is initialised.
+_RE_VULKAN_BACKEND = re.compile(
+    r"ggml_vulkan",
+    re.IGNORECASE,
+)
+
+
+def detect_vulkan_used(stderr_text: str) -> bool:
+    """Return ``True`` if the server stderr contains Vulkan backend log lines.
+
+    Used to detect *engine mismatch*: when ``--engine vulkan`` was requested
+    but the server binary was not built with Vulkan support (or defaulted to
+    a different backend).
+    """
+    return bool(_RE_VULKAN_BACKEND.search(stderr_text))

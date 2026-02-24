@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +216,10 @@ class BenchConfig:
     host: str = "0.0.0.0"
     port: int = 5001
     use_sudo: bool = True
-    vk_visible_devices: str = "0"
+    vk_visible_devices: Optional[str] = None  # None = don't set GGML_VK_VISIBLE_DEVICES
+
+    # Engine selection
+    engine: str = "vulkan"  # "vulkan" | "cpu"
 
     # Slots / context
     np: int = 1
@@ -347,8 +350,9 @@ def configs_from_args(
     threads: int = 8,
     threads_batch: int = 8,
     split_mode: str = "none",
-    vk_devices: str = "0",
+    vk_devices: Optional[str] = None,
     use_sudo: bool = True,
+    engine: str = "vulkan",
     **_kwargs: Any,
 ) -> BenchConfig:
     """Build a :class:`BenchConfig` from CLI keyword arguments."""
@@ -359,6 +363,7 @@ def configs_from_args(
         port=port,
         use_sudo=use_sudo,
         vk_visible_devices=vk_devices,
+        engine=engine,
         np=np,
         ctx=ctx,
         n_gpu_layers=n_gpu_layers,

@@ -27,8 +27,9 @@ def _default_output() -> str:
     return os.path.join("results", f"bench_{_timestamp()}.jsonl")
 
 
-def _discover_and_print_gpus() -> str:
-    from llama_bench.gpu import default_vk_devices, discover_vulkan_gpus
+def _discover_and_print_gpus() -> None:
+    """Discover Vulkan GPUs via vulkaninfo and print them; does not set env vars."""
+    from llama_bench.gpu import discover_vulkan_gpus
     gpus = discover_vulkan_gpus()
     if gpus:
         console.print(f"[green]Vulkan GPUs discovered:[/] {len(gpus)}")
@@ -36,7 +37,6 @@ def _discover_and_print_gpus() -> str:
             console.print(f"  [{g['index']}] {g['name']}")
     else:
         console.print("[yellow]No Vulkan GPUs discovered (vulkaninfo not available).[/]")
-    return default_vk_devices(gpus)
 
 
 def _resolve_server_path(server: str) -> str:
@@ -149,8 +149,13 @@ def main() -> None:
 @click.option("--threads-batch", default=8, show_default=True, help="CPU batch threads.")
 @click.option("--split-mode", default="none", show_default=True,
               type=click.Choice(["none", "layer", "row"]), help="GPU split mode.")
+@click.option("--engine", default="vulkan", show_default=True,
+              type=click.Choice(["vulkan", "cpu"]),
+              help="Inference engine backend. 'vulkan' enables GPU offload via Vulkan.")
 @click.option("--vk-devices", default=None,
-              help="GGML_VK_VISIBLE_DEVICES value (auto-discover if omitted).")
+              help="Comma-separated Vulkan device indices to expose via "
+                   "GGML_VK_VISIBLE_DEVICES.  If omitted, all devices are used "
+                   "(env var not set).")
 @click.option("--sudo/--no-sudo", default=True, show_default=True,
               help="Launch server with sudo.")
 # --- Tuner bounds ---
@@ -167,9 +172,10 @@ def main() -> None:
 @click.option("--max-retries", default=5, show_default=True,
               help="Max retry attempts per candidate config on OOM.")
 # --- Performance thresholds ---
-@click.option("--max-ttft", default=60.0, show_default=True,
-              help="Maximum acceptable TTFT in seconds.")
-@click.option("--min-tokens-per-sec", default=1.0, show_default=True,
+@click.option("--max-ttft-s", "max_ttft_s", default=None, type=float,
+              help="Maximum acceptable TTFT in seconds. Disabled by default; "
+                   "TTFT is recorded but does not gate usability.")
+@click.option("--min-tokens-per-sec", default=4.0, show_default=True,
               help="Minimum acceptable decode throughput (tokens/s).")
 @click.option("--ctx-pct-threshold", default=0.90, show_default=True,
               help="Fraction of max usable ctx for secondary throughput ranking.")
@@ -187,9 +193,9 @@ def bench(
     server, model, host, port, np, ctx, n_gpu_layers, flash_attn,
     batch_size, ubatch_size, cache_type_k, cache_type_v, kv_unified,
     cache_reuse, cont_batching, threads, threads_batch, split_mode,
-    vk_devices, sudo,
+    engine, vk_devices, sudo,
     ctx_min, ctx_max, ctx_step, ngl_step, batch_step, max_retries,
-    max_ttft, min_tokens_per_sec, ctx_pct_threshold,
+    max_ttft_s, min_tokens_per_sec, ctx_pct_threshold,
     output, summary, prompt_pack, no_tui, verbosity,
 ) -> None:
     """Adaptive configuration tuner: find the highest usable context for your model.
@@ -214,10 +220,11 @@ def bench(
 
     server = _resolve_server_path(server)
 
-    if vk_devices is None:
-        vk_devices = _discover_and_print_gpus()
-    else:
-        console.print(f"Using VK devices: {vk_devices}")
+    # GPU discovery (print only; env var set only if --vk-devices explicitly given)
+    if engine == "vulkan":
+        _discover_and_print_gpus()
+        if vk_devices is not None:
+            console.print(f"[dim]Using VK devices: {vk_devices}[/]")
 
     _check_version(server, sudo)
 
@@ -230,7 +237,7 @@ def bench(
         ubatch_size=ubatch_size, cache_type_k=cache_type_k, cache_type_v=cache_type_v,
         kv_unified=kv_unified, cache_reuse=cache_reuse, cont_batching=cont_batching,
         threads=threads, threads_batch=threads_batch, split_mode=split_mode,
-        vk_devices=vk_devices, use_sudo=sudo,
+        vk_devices=vk_devices, use_sudo=sudo, engine=engine,
     )
     _print_validation(base_cfg)
 
@@ -243,7 +250,7 @@ def bench(
         max_retries=max_retries,
     )
     thresholds = TunerThresholds(
-        max_ttft_s=max_ttft,
+        max_ttft_s=max_ttft_s,
         min_tokens_per_sec=min_tokens_per_sec,
     )
 
@@ -251,7 +258,7 @@ def bench(
 
     console.print(
         f"[bold]Tuner sweep[/] ctx {effective_ctx_max}→{ctx_min} step {ctx_step} "
-        f"| max_retries={max_retries} | output → {output_path}"
+        f"| engine={engine} | max_retries={max_retries} | output → {output_path}"
     )
 
     def _plain_progress(current: int, total: int) -> None:
@@ -269,9 +276,19 @@ def bench(
         total_candidates = max(
             1, (effective_ctx_max - ctx_min) // ctx_step + 1
         )
+        # Build initial to-do list
+        todos = [
+            f"ctx={effective_ctx_max - i * ctx_step} ngl={n_gpu_layers} batch={batch_size}"
+            for i in range(total_candidates)
+        ]
         with BenchTUI() as tui:
+            tui.set_todos(todos)
+
             def _tui_progress(current: int, total: int) -> None:
                 tui.update_progress(current, total, 1, "tuner sweep")
+                # Update remaining to-dos
+                remaining = todos[current:]
+                tui.set_todos(remaining)
 
             tuner = AdaptiveTuner(
                 base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
@@ -280,13 +297,34 @@ def bench(
             )
             attempts = tuner.run()
 
+            # Show engine mismatch warning (red) if any attempt detected it
+            engine_mismatch_shown = False
             for a in attempts:
-                score = a.ttft_s * 1000.0 if a.success else float("inf")
+                if a.engine_mismatch and not engine_mismatch_shown:
+                    tui.add_error(
+                        f"Engine mismatch: --engine {engine} requested but Vulkan backend "
+                        "was not active in server. Check your llama-server build.",
+                        red=True,
+                    )
+                    engine_mismatch_shown = True
+
+            for a in attempts:
+                tui.set_current_state(
+                    f"ctx={a.ctx} ngl={a.n_gpu_layers} batch={a.batch_size}"
+                )
+                score = a.tokens_per_sec if a.success else 0.0
                 tui.add_result(
                     a.run_id,
                     f"ctx={a.ctx} ngl={a.n_gpu_layers} batch={a.batch_size}",
                     score, a.success, a.failure_reason,
                 )
+
+    # Engine mismatch warning for no-tui mode
+    if any(a.engine_mismatch for a in attempts):
+        console.print(
+            f"[bold red]Engine mismatch:[/red] --engine {engine} requested but Vulkan "
+            "backend was not active in server. Check your llama-server build."
+        )
 
     # Write JSONL
     from llama_bench.tuner import _attempt_to_dict as _atd
@@ -428,7 +466,7 @@ def search(
     server = _resolve_server_path(server)
 
     if vk_devices is None:
-        vk_devices = _discover_and_print_gpus()
+        _discover_and_print_gpus()
 
     _check_version(server, sudo)
 

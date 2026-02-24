@@ -52,10 +52,14 @@ class TunerBounds:
 
 @dataclass
 class TunerThresholds:
-    """Minimum performance thresholds that define a "usable" config."""
+    """Minimum performance thresholds that define a "usable" config.
 
-    max_ttft_s: float = 60.0
-    min_tokens_per_sec: float = 1.0
+    ``max_ttft_s=None`` disables TTFT gating entirely; TTFT is still recorded
+    and used for ranking but does not cause a config to be rejected.
+    """
+
+    max_ttft_s: Optional[float] = None  # None = TTFT gating disabled by default
+    min_tokens_per_sec: float = 4.0
 
 
 @dataclass
@@ -78,6 +82,7 @@ class TuneAttempt:
     run_id: str = ""
     timestamp: str = ""
     log_file: Optional[str] = None
+    engine_mismatch: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -376,14 +381,24 @@ class AdaptiveTuner:
             projected_mib, free_mib = fit
             if projected_mib > 0 and free_mib < projected_mib:
                 ratio = free_mib / projected_mib
-                new_ctx = int(cfg.ctx * ratio * 0.90)  # reduce by 10% extra to give headroom
-                # Round down to ctx_step boundary
-                new_ctx = (new_ctx // self.bounds.ctx_step) * self.bounds.ctx_step
-                logger.debug(
-                    "OOM adaptation (heuristic): ctx %d → %d "
-                    "(projected=%.0f MiB free=%.0f MiB ratio=%.2f)",
-                    cfg.ctx, new_ctx, projected_mib, free_mib, ratio,
-                )
+                if ratio < 0.5:
+                    # Memory way too low — big-step ladder (J2): halve ctx
+                    new_ctx = cfg.ctx // 2
+                    new_ctx = (new_ctx // self.bounds.ctx_step) * self.bounds.ctx_step
+                    logger.debug(
+                        "OOM adaptation (big-step): ctx %d → %d "
+                        "(projected=%.0f MiB free=%.0f MiB ratio=%.2f)",
+                        cfg.ctx, new_ctx, projected_mib, free_mib, ratio,
+                    )
+                else:
+                    new_ctx = int(cfg.ctx * ratio * 0.90)  # reduce by 10% extra to give headroom
+                    # Round down to ctx_step boundary
+                    new_ctx = (new_ctx // self.bounds.ctx_step) * self.bounds.ctx_step
+                    logger.debug(
+                        "OOM adaptation (heuristic): ctx %d → %d "
+                        "(projected=%.0f MiB free=%.0f MiB ratio=%.2f)",
+                        cfg.ctx, new_ctx, projected_mib, free_mib, ratio,
+                    )
                 if new_ctx >= self.bounds.ctx_min and new_ctx < cfg.ctx:
                     new_cfg = copy.deepcopy(cfg)
                     new_cfg.ctx = new_ctx
@@ -497,17 +512,20 @@ class AdaptiveTuner:
         )
 
         # Check performance thresholds
-        usable = (
-            avg_ttft_s <= self.thresholds.max_ttft_s
-            and avg_tps >= self.thresholds.min_tokens_per_sec
+        # TTFT gating is disabled when max_ttft_s is None (still recorded for ranking).
+        ttft_ok = (
+            self.thresholds.max_ttft_s is None
+            or avg_ttft_s <= self.thresholds.max_ttft_s
         )
+        usable = ttft_ok and avg_tps >= self.thresholds.min_tokens_per_sec
         failure_reason: Optional[str] = None
         if not usable:
-            if avg_ttft_s > self.thresholds.max_ttft_s:
+            if not ttft_ok:
                 failure_reason = "ttft_exceeded"
             else:
                 failure_reason = "throughput_too_low"
 
+        engine_mismatch = any(m.engine_mismatch for m in successful)
         best = successful[0]
         return TuneAttempt(
             config=cfg,
@@ -523,4 +541,5 @@ class AdaptiveTuner:
             run_id=best.run_id,
             timestamp=best.timestamp,
             log_file=self.log_file,
+            engine_mismatch=engine_mismatch,
         )
