@@ -795,7 +795,7 @@ class BenchApp(App):
             self._activity(f"▷  ctx={ctx}  ngl={ngl}  batch={batch}  — {phase}")
 
         elif event == "retry":
-
+            pass
         elif event == "hall_of_fame":
             s.hall_of_fame = dict(data)
             self.query_one(HallOfFameWidget).refresh_content(s.hall_of_fame)
