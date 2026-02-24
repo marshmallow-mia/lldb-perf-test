@@ -1,0 +1,241 @@
+# llama-bench — Single-mode llama-server tuner (Reverse Engineering workload)
+
+## What this tool is
+`llama-bench` is a **single-mode tuning and validation tool** for `llama-server` (llama.cpp).  
+It automatically runs a **realistic “reverse engineering” workload** against a locally started `llama-server`, while iterating server configuration parameters to find stable, performant settings on your hardware.
+
+It is **not** a correctness benchmark. It’s a **stability + performance + capacity (context)** tuner.
+
+---
+
+## Goal (what we optimize for)
+Primary goal (**D3 multi-objective**):
+
+1. **Maximize usable context length** (largest context size that works reliably on the target machine).
+2. Among configurations “near” the max usable context (e.g., within ~90% of it), recommend configs that:
+   - maximize **throughput** (tokens/sec)
+   - and/or minimize **TTFT** (time-to-first-token)
+
+The final output should answer:
+- “What is the highest usable context for this model + hardware + use case?”
+- “What settings give the best speed-to-context ratio near that maximum?”
+
+---
+
+## What it tests
+For each candidate server configuration, the tool tests:
+
+1. **Server can start and become ready**
+   - Start `llama-server` as a subprocess
+   - Wait for readiness by polling `GET /health` once per second
+   - Stop waiting immediately if the process exits
+
+2. **Workload can complete without server failure**
+   - Run a reverse-engineering workload (see prompt corpus below)
+   - The run must complete without:
+     - server crash
+     - HTTP 5xx errors
+     - non-recoverable request failures
+
+3. **Minimum performance threshold**
+   - A config is considered **usable (U2)** if it is stable **and** meets:
+     - **min tokens/sec >= 4** (default, configurable)
+   - **TTFT gating is disabled by default** (to avoid failing low-performance hardware).
+     - TTFT is still measured and used for ranking
+     - users can optionally enable TTFT gating with `--max-ttft-s`
+
+---
+
+## Workload / prompt corpus (Reverse Engineering)
+The reverse-engineering workload prompt is constructed from repository files:
+
+**Included in prompt input:**
+- `README.md`
+- `agent.md`
+- `artifacts.md`
+
+**Excluded from prompt input:**
+- `solution.md`  
+  - must remain present in the repo unchanged  
+  - must **not** be included in any prompt sent to the model
+
+The intent is to simulate a realistic “reverse engineering” context where the model receives tool/project context and must respond under long-context conditions.
+
+---
+
+## Single-mode CLI UX
+There is **one unified run mode** (no separate `bench` vs `search` modes).  
+Users run the tool to perform a declared tuning/testing session. In the first version the only use case is the reverse-engineering.
+
+Key UX requirements:
+- Provide a **terminal UI (CLI GUI)** (inspired by llmfit’s simplicity, not the same UI) showing:
+  - **To‑Dos**: what configs will be attempted next
+  - **Current state**: what the tool is doing right now
+  - **Errors**: recent failures and classifications (prominent)
+  - **Estimated time left**: based on progress and attempt durations
+- `--no-tui` option for log-only runs
+- Verbose logging:
+  - `-v` for info
+  - `-vv` for debug
+  - logs to stderr and to a session log file under `results/`
+
+Warnings and errors must be easy to see. In particular:
+- If Vulkan is requested but appears not to be in use, show a **red warning** in the UI and flag results.
+
+---
+
+## How it works (high-level flow)
+1. **Validate inputs**
+   - server binary exists and is executable
+   - model path is readable
+   - required prompt files exist (README.md, agent.md, artifacts.md)
+   - (critical failures abort immediately)
+
+2. **Build the workload prompt**
+   - read included corpus files
+   - assemble a single prompt payload (or multiple requests) suitable for reverse engineering workload
+
+3. **Generate candidate configs**
+   - vary:
+     - context length (`--ctx-size` / ctx)
+     - GPU layers (`--n-gpu-layers`)
+     - batch size (`--batch-size`)
+   - explore configurations to find max usable ctx and best configs near it
+
+4. **Run candidate config**
+   - start server with computed args + env
+   - wait for readiness via `/health`
+   - run the workload requests
+   - collect metrics (tok/s, TTFT, total time, HTTP errors)
+
+5. **Classify failure and adapt**
+   - If success → store metrics, consider increasing ctx or exploring near-max region
+   - If failure → classify and apply an adaptation policy to try likely fixes while preserving the end goal (maximize usable ctx)
+
+6. **Report results**
+   - in UI and log output
+   - write machine-readable artifacts:
+     - JSONL attempts log
+     - `results/summary.json` with best configs / recommendations
+
+---
+
+## Hardware selection / Vulkan control
+The tool must be able to reliably steer hardware usage (GPU-first expected).
+
+### Flags
+- `--engine {vulkan,cpu}` (at least)
+- `--vk-devices 0,1` optional (device indices)
+
+### Device mapping behavior
+To avoid hardcoding device names, the tool uses:
+- `${server} --list-devices`
+
+Example output shows available names like:
+- `Vulkan0`
+- `Vulkan1`
+
+Rules:
+- If `--engine vulkan` and `--vk-devices` is provided:
+  - set env: `GGML_VK_VISIBLE_DEVICES=0,1` (exactly as provided)
+  - pass: `--device Vulkan0,Vulkan1` (resolved dynamically from `--list-devices`)
+  - if user requests an index that doesn’t exist → **critical error** (abort), show available devices
+- If `--engine vulkan` and `--vk-devices` is omitted (**Option A**):
+  - do **not** set `GGML_VK_VISIBLE_DEVICES`
+  - do **not** pass `--device`
+  - let `llama-server` choose devices by default
+- If `--engine cpu`:
+  - pass `--device none` to prevent offload
+
+### Engine mismatch warning
+If `--engine vulkan` is requested but server logs do not show Vulkan backend indicators (e.g. `ggml_vulkan:` / `loaded Vulkan backend`):
+- **continue the run** (do not hard fail)
+- flag attempt/result with an engine mismatch marker
+- show a **red warning** prominently in the CLI GUI
+
+---
+
+## Adaptive error handling (core tuning logic)
+The tool must distinguish between:
+- **Critical errors** (abort entire run)
+- **Expected errors** (adapt configuration and continue)
+
+### Critical errors (abort)
+- missing/non-executable server binary
+- missing/unreadable model
+- permission errors
+- invalid GGUF / cannot open model file
+
+### Expected errors (adapt)
+- VRAM OOM and Vulkan allocation failures
+- llama.cpp fit failures (e.g. `failed to fit params to free device memory`)
+
+### Failure classification (priority matters)
+Classify stderr (and relevant stdout) with priority ordering so OOM/fit does not get misclassified as “model not found”.
+
+`out_of_vram` when matching any of:
+- `ErrorOutOfDeviceMemory`
+- `Device memory allocation .* failed`
+- `failed to allocate Vulkan0 buffer`
+- `unable to allocate Vulkan0 buffer`
+- `failed to fit params to free device memory`
+
+`model_not_found` only when matching true missing-file patterns:
+- `failed to open GGUF file`
+- `No such file or directory`
+
+Fallbacks:
+- `server_exited`
+- `server_startup_timeout`
+- `http_error`
+
+### Adaptation policy (P)
+Reduce what is most likely to help without breaking the end goal too much:
+
+- `--n-gpu-layers`: down/up by **4**
+- `--batch-size`: down/up by **256**
+- `--ctx`: adjust based on error severity
+  - Use **J2 fixed big-step ladder** when memory is “way too low” (aggressive reduction steps)
+  - otherwise use a normal ctx step (configurable)
+
+Each candidate config may be retried with bounded attempts (no infinite loops).
+
+---
+
+## Logging & artifacts
+### Logs
+- Console logs to stderr
+- Always write a session log file under `results/`
+
+### llama-server stdout/stderr files (single per run)
+Do **not** create many per-attempt files.
+
+Instead:
+- `results/server_stdout.log`
+- `results/server_stderr.log`
+
+Include attempt separator headers for correlation.
+
+### Results outputs
+- JSONL per attempt containing:
+  - config parameters
+  - success/failure + failure_reason
+  - metrics: TTFT, tok/s, total time
+  - engine mismatch flag if applicable
+  - paths to stdout/stderr logs and session log
+- `results/summary.json` containing:
+  - max usable ctx config
+  - top configs near max usable ctx
+  - recommended stable config
+
+---
+
+## What “done” looks like
+A single command run:
+- iterates multiple server configs automatically
+- adapts on OOM/fit failures (changes gpu layers/batch/ctx) rather than stopping
+- produces a clear final recommendation for:
+  - max usable context
+  - best performance near that context
+- uses GPU as intended when requested (and clearly warns if not)
+- produces clean, consolidated logs and machine-readable results

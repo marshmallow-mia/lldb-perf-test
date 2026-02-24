@@ -277,11 +277,14 @@ def build_prompt_sequence(n_followups: int = 4, use_system: bool = True) -> list
     # Reuse questions (cycle if n_followups > len(FOLLOWUP_QUESTIONS))
     for i in range(n_followups):
         question = FOLLOWUP_QUESTIONS[i % len(FOLLOWUP_QUESTIONS)]
-        # Include shared context again to simulate cache reuse
+        # Fresh independent request re-sending the same shared prefix.
+        # Each follow-up is NOT a continuation of the prior conversation —
+        # it re-sends the corpus so the server can reuse its KV-cache prefix.
         combined = shared_context + "\n\n" + question
-        followup_messages = list(messages_initial) + [
-            {"role": "user", "content": combined}
-        ]
+        followup_messages: list[dict] = []
+        if use_system:
+            followup_messages.append({"role": "system", "content": REVERSE_ENGINEERING_SYSTEM_PROMPT})
+        followup_messages.append({"role": "user", "content": combined})
         sequence.append(
             {
                 "messages": followup_messages,

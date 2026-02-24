@@ -147,8 +147,8 @@ def main() -> None:
               help="Enable continuous batching.")
 @click.option("--threads", default=8, show_default=True, help="CPU inference threads.")
 @click.option("--threads-batch", default=8, show_default=True, help="CPU batch threads.")
-@click.option("--split-mode", default="none", show_default=True,
-              type=click.Choice(["none", "layer", "row"]), help="GPU split mode.")
+@click.option("--split-mode", default=None,
+              type=click.Choice(["none", "layer", "row"]), help="GPU split mode (default: auto — 'layer' for multiple Vulkan devices, 'none' otherwise).")
 @click.option("--engine", default="vulkan", show_default=True,
               type=click.Choice(["vulkan", "cpu"]),
               help="Inference engine backend. 'vulkan' enables GPU offload via Vulkan.")
@@ -187,6 +187,8 @@ def main() -> None:
 @click.option("--prompt-pack", default=None, type=click.Path(exists=True),
               help="Path to a custom prompt pack (JSON/YAML).")
 @click.option("--no-tui", is_flag=True, default=False, help="Disable TUI, use plain output.")
+@click.option("--max-tokens", default=512, show_default=True,
+              help="Maximum tokens to generate per request.")
 @click.option("-v", "--verbose", "verbosity", count=True,
               help="Verbose output; use -vv for debug-level logging.")
 def bench(
@@ -196,7 +198,7 @@ def bench(
     engine, vk_devices, sudo,
     ctx_min, ctx_max, ctx_step, ngl_step, batch_step, max_retries,
     max_ttft_s, min_tokens_per_sec, ctx_pct_threshold,
-    output, summary, prompt_pack, no_tui, verbosity,
+    output, summary, prompt_pack, no_tui, verbosity, max_tokens,
 ) -> None:
     """Adaptive configuration tuner: find the highest usable context for your model.
 
@@ -250,6 +252,14 @@ def bench(
             # No --vk-devices: do not set GGML_VK_VISIBLE_DEVICES, do not pass --device
             console.print("[dim]No --vk-devices specified; letting server choose Vulkan device(s)[/]")
 
+    # Auto-detect split mode: 'layer' is required for multi-GPU, 'none' for single/CPU
+    if split_mode is None:
+        if resolved_device and "," in resolved_device:
+            split_mode = "layer"
+            console.print("[dim]Auto-set --split-mode layer (multiple Vulkan devices)[/]")
+        else:
+            split_mode = "none"
+
     _check_version(server, sudo)
 
     # Use --ctx as the starting/max context if --ctx-max not explicitly provided
@@ -292,7 +302,7 @@ def bench(
         tuner = AdaptiveTuner(
             base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
             artifacts_dir=artifacts_dir, log_file=log_file,
-            progress_cb=_plain_progress,
+            progress_cb=_plain_progress, max_tokens=max_tokens,
         )
         attempts = tuner.run()
     else:
@@ -317,7 +327,7 @@ def bench(
             tuner = AdaptiveTuner(
                 base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
                 artifacts_dir=artifacts_dir, log_file=log_file,
-                progress_cb=_tui_progress,
+                progress_cb=_tui_progress, max_tokens=max_tokens,
             )
             attempts = tuner.run()
 
