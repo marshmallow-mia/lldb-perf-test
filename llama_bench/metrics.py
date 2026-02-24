@@ -46,7 +46,6 @@ class RunMetrics:
     stderr_path: Optional[str] = None
     stdout_path: Optional[str] = None
     server_error_excerpt: Optional[str] = None
-    engine_mismatch: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,6 @@ from llama_bench.metrics import (
     RunMetrics,
     classify_failure,
     classify_server_stderr,
-    detect_vulkan_used,
     extract_server_error_excerpt,
     metrics_to_dict,
     parse_server_log,
@@ -59,7 +58,7 @@ def _build_server_cmd(cfg: BenchConfig) -> list[str]:
         "--port", str(cfg.port),
         "-np", str(cfg.np),
         "-c", str(cfg.ctx),
-        "-n", "4096",
+        "-n", str(cfg.max_predict_tokens),
         "--batch-size", str(cfg.batch_size),
         "--ubatch-size", str(cfg.ubatch_size),
         "--n-gpu-layers", str(cfg.n_gpu_layers),
@@ -299,18 +298,14 @@ class BenchmarkRunner:
 
     def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results",
                  log_file: Optional[str] = None,
-                 server_log_stdout: Optional[str] = None,
-                 server_log_stderr: Optional[str] = None) -> None:
+                 max_tokens: int = 512) -> None:
         self.cfg = cfg
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
-        self.server_log_stdout = server_log_stdout
-        self.server_log_stderr = server_log_stderr
+        self.max_tokens = max_tokens
         os.makedirs(artifacts_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+
 
     def run_single(
         self,
@@ -322,21 +317,13 @@ class BenchmarkRunner:
         results: list[RunMetrics] = []
 
         try:
+            handle = start_server(self.cfg, self.artifacts_dir)
+            logger.info("Server command: %s", " ".join(_build_server_cmd(self.cfg)))
             logger.info("Starting server for run (config_hash will be assigned per-prompt)")
-            attempt_header = (
-                f"ctx={self.cfg.ctx} ngl={self.cfg.n_gpu_layers} "
-                f"batch={self.cfg.batch_size} engine={self.cfg.engine}"
-            )
-            handle = start_server(
-                self.cfg,
-                self.artifacts_dir,
-                stdout_path=self.server_log_stdout,
-                stderr_path=self.server_log_stderr,
-                attempt_header=attempt_header,
-            )
             logger.info("Waiting for server to become ready (timeout=90s)")
             startup_failure = wait_for_server_ready(
-                self.cfg.host, self.cfg.port, timeout=90.0, proc=handle.process
+                self.cfg.host, self.cfg.port, timeout=90.0,
+                proc=handle.process,
             )
 
             if startup_failure is not None:
@@ -367,27 +354,17 @@ class BenchmarkRunner:
                 )
                 return results
 
-            # Detect engine mismatch: when vulkan engine requested but not active in server
-            _engine_mismatch = False
-            if self.cfg.engine == "vulkan":
-                try:
-                    with open(handle.stderr_path, "r", encoding="utf-8", errors="replace") as fh:
-                        _startup_stderr = fh.read()
-                    _engine_mismatch = not detect_vulkan_used(_startup_stderr)
-                    if _engine_mismatch:
-                        logger.warning(
-                            "Engine mismatch: --engine vulkan requested but no Vulkan "
-                            "backend lines found in server stderr"
-                        )
-                except OSError:
-                    pass
-
             for idx, item in enumerate(prompt_sequence):
                 messages = item.get("messages", [])
                 run_id = _make_run_id(self.cfg)
                 ts = datetime.now(timezone.utc).isoformat()
                 ch = _config_hash(self.cfg)
-                logger.info("Benchmark request %d/%d run_id=%s", idx + 1, len(prompt_sequence), run_id)
+                total_prompts = len(prompt_sequence)
+                if idx == 0:
+                    step_label = "Initial request"
+                else:
+                    step_label = f"Follow-up {idx}/{total_prompts - 1}"
+                logger.info("Benchmark request %d/%d run_id=%s", idx + 1, total_prompts, run_id)
 
                 try:
                     # Run streaming request
@@ -418,7 +395,6 @@ class BenchmarkRunner:
                             timestamp=ts,
                             config_hash=ch,
                             log_file=self.log_file,
-                            engine_mismatch=_engine_mismatch,
                         )
                     )
                 except KeyboardInterrupt:
@@ -434,7 +410,6 @@ class BenchmarkRunner:
                             timestamp=ts,
                             config_hash=ch,
                             log_file=self.log_file,
-                            engine_mismatch=_engine_mismatch,
                         )
                     )
         finally:
@@ -461,7 +436,7 @@ class BenchmarkRunner:
         payload = {
             "messages": messages,
             "stream": True,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         start = time.monotonic()
         ttft_ms = 0.0
@@ -518,7 +493,7 @@ class BenchmarkRunner:
         payload = {
             "messages": messages,
             "stream": False,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         start = time.monotonic()
         resp = requests.post(self._endpoint(), json=payload, timeout=timeout)
