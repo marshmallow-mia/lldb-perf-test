@@ -205,6 +205,7 @@ def bench(
     """
     import json as _json
     from llama_bench.config import configs_from_args
+    from llama_bench.gpu import list_devices_from_server
     from llama_bench.logging_setup import setup_logging
     from llama_bench.prompts import build_prompt_sequence, load_prompt_pack
     from llama_bench.tuner import (
@@ -220,11 +221,34 @@ def bench(
 
     server = _resolve_server_path(server)
 
-    # GPU discovery (print only; env var set only if --vk-devices explicitly given)
-    if engine == "vulkan":
+    # Device resolution via --list-devices
+    resolved_device: Optional[str] = None
+    if engine == "cpu":
+        resolved_device = "none"
+        console.print("[dim]Engine: cpu — passing --device none to llama-server[/]")
+    elif engine == "vulkan":
         _discover_and_print_gpus()
+        available_devices = list_devices_from_server(server)
+        if available_devices:
+            console.print("[green]Available devices (from --list-devices):[/]")
+            for idx, name in sorted(available_devices.items()):
+                console.print(f"  [{idx}] {name}")
         if vk_devices is not None:
-            console.print(f"[dim]Using VK devices: {vk_devices}[/]")
+            # Validate and resolve requested device indices
+            requested_indices = [int(x.strip()) for x in vk_devices.split(",")]
+            missing = [i for i in requested_indices if i not in available_devices]
+            if missing:
+                console.print(
+                    f"[bold red]Error:[/] Requested Vulkan device index(es) {missing} "
+                    f"not found. Available: {dict(sorted(available_devices.items()))}"
+                )
+                sys.exit(1)
+            resolved_names = ",".join(available_devices[i] for i in requested_indices)
+            resolved_device = resolved_names
+            console.print(f"[dim]Using VK devices: {vk_devices} → {resolved_device}[/]")
+        else:
+            # No --vk-devices: do not set GGML_VK_VISIBLE_DEVICES, do not pass --device
+            console.print("[dim]No --vk-devices specified; letting server choose Vulkan device(s)[/]")
 
     _check_version(server, sudo)
 
@@ -237,7 +261,7 @@ def bench(
         ubatch_size=ubatch_size, cache_type_k=cache_type_k, cache_type_v=cache_type_v,
         kv_unified=kv_unified, cache_reuse=cache_reuse, cont_batching=cont_batching,
         threads=threads, threads_batch=threads_batch, split_mode=split_mode,
-        vk_devices=vk_devices, use_sudo=sudo, engine=engine,
+        vk_devices=vk_devices, use_sudo=sudo, engine=engine, device=resolved_device,
     )
     _print_validation(base_cfg)
 

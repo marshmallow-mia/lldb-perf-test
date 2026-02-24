@@ -82,18 +82,39 @@ def _build_server_cmd(cfg: BenchConfig) -> list[str]:
     if cfg.cont_batching:
         cmd.append("--cont-batching")
 
+    # Device selection: --device none for CPU; --device Vulkan0,Vulkan1 when resolved.
+    if cfg.device is not None:
+        cmd += ["--device", cfg.device]
+
     return cmd
 
 
-def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHandle:
+def start_server(
+    cfg: BenchConfig,
+    artifacts_dir: str = "results",
+    stdout_path: Optional[str] = None,
+    stderr_path: Optional[str] = None,
+    attempt_header: Optional[str] = None,
+) -> ServerHandle:
     """Launch llama-server as a subprocess, redirecting I/O to log files.
+
+    If *stdout_path* and *stderr_path* are provided the files are opened in
+    **append** mode (supporting a single consolidated log across multiple
+    server launches) and a separator header is written before each launch.
+    When they are omitted, per-attempt timestamp-named files are created in
+    *artifacts_dir*.
 
     Returns a :class:`ServerHandle` describing the running process.
     """
     os.makedirs(artifacts_dir, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    stdout_path = os.path.join(artifacts_dir, f"server_stdout_{timestamp}.log")
-    stderr_path = os.path.join(artifacts_dir, f"server_stderr_{timestamp}.log")
+
+    if stdout_path is None or stderr_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        stdout_path = os.path.join(artifacts_dir, f"server_stdout_{timestamp}.log")
+        stderr_path = os.path.join(artifacts_dir, f"server_stderr_{timestamp}.log")
+        file_mode = "w"
+    else:
+        file_mode = "a"
 
     cmd = _build_server_cmd(cfg)
     env = build_env(cfg.vk_visible_devices)
@@ -104,8 +125,16 @@ def start_server(cfg: BenchConfig, artifacts_dir: str = "results") -> ServerHand
     logger.info("Server stderr log: %s", stderr_path)
     logger.debug("Starting server: %s", " ".join(cmd))
 
-    stdout_fh = open(stdout_path, "w")  # noqa: WPS515 – kept open for the lifetime of the server process
-    stderr_fh = open(stderr_path, "w")
+    # Write attempt separator header for consolidated log files
+    if file_mode == "a":
+        header = attempt_header or f"attempt @ {datetime.now(timezone.utc).isoformat()}"
+        separator = f"\n{'=' * 60}\n=== {header} ===\n{'=' * 60}\n"
+        for path in (stdout_path, stderr_path):
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(separator)
+
+    stdout_fh = open(stdout_path, file_mode, encoding="utf-8")  # noqa: WPS515 – kept open for the lifetime of the server process
+    stderr_fh = open(stderr_path, file_mode, encoding="utf-8")
 
     try:
         proc = subprocess.Popen(
@@ -269,10 +298,14 @@ class BenchmarkRunner:
     """Orchestrate start/stop of llama-server and execution of prompts."""
 
     def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results",
-                 log_file: Optional[str] = None) -> None:
+                 log_file: Optional[str] = None,
+                 server_log_stdout: Optional[str] = None,
+                 server_log_stderr: Optional[str] = None) -> None:
         self.cfg = cfg
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
+        self.server_log_stdout = server_log_stdout
+        self.server_log_stderr = server_log_stderr
         os.makedirs(artifacts_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -290,7 +323,17 @@ class BenchmarkRunner:
 
         try:
             logger.info("Starting server for run (config_hash will be assigned per-prompt)")
-            handle = start_server(self.cfg, self.artifacts_dir)
+            attempt_header = (
+                f"ctx={self.cfg.ctx} ngl={self.cfg.n_gpu_layers} "
+                f"batch={self.cfg.batch_size} engine={self.cfg.engine}"
+            )
+            handle = start_server(
+                self.cfg,
+                self.artifacts_dir,
+                stdout_path=self.server_log_stdout,
+                stderr_path=self.server_log_stderr,
+                attempt_header=attempt_header,
+            )
             logger.info("Waiting for server to become ready (timeout=90s)")
             startup_failure = wait_for_server_ready(
                 self.cfg.host, self.cfg.port, timeout=90.0, proc=handle.process
