@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from typing import Optional
 
 
 def discover_vulkan_gpus() -> list[dict]:
@@ -59,8 +60,14 @@ def default_vk_devices(gpus: list[dict]) -> str:
     return ",".join(str(g["index"]) for g in gpus)
 
 
-def build_env(vk_visible_devices: str) -> dict:
-    """Return a copy of :data:`os.environ` with ``GGML_VK_VISIBLE_DEVICES`` set."""
+def build_env(vk_visible_devices: Optional[str]) -> dict:
+    """Return a copy of :data:`os.environ`.
+
+    If *vk_visible_devices* is not ``None``, sets ``GGML_VK_VISIBLE_DEVICES``.
+    When omitted (``None``) the environment variable is left unset so the server
+    uses all available Vulkan devices.
+    """
     env = os.environ.copy()
-    env["GGML_VK_VISIBLE_DEVICES"] = vk_visible_devices
+    if vk_visible_devices is not None:
+        env["GGML_VK_VISIBLE_DEVICES"] = vk_visible_devices
     return env

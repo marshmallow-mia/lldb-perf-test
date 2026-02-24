@@ -21,6 +21,7 @@ from llama_bench.metrics import (
     RunMetrics,
     classify_failure,
     classify_server_stderr,
+    detect_vulkan_used,
     extract_server_error_excerpt,
     metrics_to_dict,
     parse_server_log,
@@ -323,6 +324,21 @@ class BenchmarkRunner:
                 )
                 return results
 
+            # Detect engine mismatch: when vulkan engine requested but not active in server
+            _engine_mismatch = False
+            if self.cfg.engine == "vulkan":
+                try:
+                    with open(handle.stderr_path, "r", encoding="utf-8", errors="replace") as fh:
+                        _startup_stderr = fh.read()
+                    _engine_mismatch = not detect_vulkan_used(_startup_stderr)
+                    if _engine_mismatch:
+                        logger.warning(
+                            "Engine mismatch: --engine vulkan requested but no Vulkan "
+                            "backend lines found in server stderr"
+                        )
+                except OSError:
+                    pass
+
             for idx, item in enumerate(prompt_sequence):
                 messages = item.get("messages", [])
                 run_id = _make_run_id(self.cfg)
@@ -359,6 +375,7 @@ class BenchmarkRunner:
                             timestamp=ts,
                             config_hash=ch,
                             log_file=self.log_file,
+                            engine_mismatch=_engine_mismatch,
                         )
                     )
                 except KeyboardInterrupt:
@@ -374,6 +391,7 @@ class BenchmarkRunner:
                             timestamp=ts,
                             config_hash=ch,
                             log_file=self.log_file,
+                            engine_mismatch=_engine_mismatch,
                         )
                     )
         finally:

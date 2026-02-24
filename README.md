@@ -30,7 +30,7 @@ for your hardware.
 `llama-server` flags gives the best latency and context capacity for my model,
 GPU, and workload?*
 
-It has a **single tuning mode** (`bench`) that:
+It has a **single unified tuning mode** (`bench`) that:
 
 1. Iterates candidate context sizes from `--ctx` down to `--ctx-min` in steps of
    `--ctx-step`, adjusting GPU layers and batch size when VRAM OOM is detected.
@@ -44,18 +44,33 @@ It has a **single tuning mode** (`bench`) that:
 
 Key features:
 
+- **Single tuning mode**: No separate bench/search modes. One unified `bench`
+  command for the reverse-engineering use case.
 - **Adaptive error handling**: VRAM OOM automatically reduces `--n-gpu-layers` and
-  `--batch-size` within configurable bounds before retrying.
+  `--batch-size` within configurable bounds before retrying.  Memory-fit
+  heuristics trigger either a proportional or big-step (halve) context reduction
+  depending on how far memory is from fitting.
 - **Reverse-engineering workload**: prompt corpus loaded from `README.md`,
   `agent.md`, and `artifacts.md` (never `solution.md`), exercising
   KV-cache prefix reuse across multi-turn conversations.
-- **Rich TUI**: live progress bar, rolling results table, best-so-far display.
-  Disable with `--no-tui` for CI or logging use.
+- **Usability threshold**: A configuration is *usable* when
+  `tokens/s >= --min-tokens-per-sec` (default **4.0**).  TTFT is always recorded
+  and used for ranking, but TTFT gating is **disabled by default** (enable with
+  `--max-ttft-s`).
+- **Engine selection** (`--engine`): choose `vulkan` (default, GPU via Vulkan) or
+  `cpu`.  Pass `--vk-devices` to restrict which Vulkan device indices are visible
+  to the server.  If `--vk-devices` is omitted, `GGML_VK_VISIBLE_DEVICES` is not
+  set (all devices visible).
+- **Engine mismatch detection**: if `--engine vulkan` was requested but the server
+  binary does not emit any Vulkan backend lines, a **red warning** is displayed in
+  the TUI and printed to stdout.
+- **Rich TUI**: live display with four panels — *To-Dos* (remaining configs),
+  *Current State* (config under test), *Progress* bar with ETA, and *Errors /
+  Warnings* (critical errors in red, warnings in yellow).  Disable with
+  `--no-tui` for CI or logging use.
 - **Verbose logging** (`-v` / `-vv`): INFO or DEBUG output to stderr *and* a
   timestamped log file under the results directory.
-- **Report generation** (`report`): JSONL → Markdown with ranked tables.
-- **Vulkan GPU discovery**: auto-detects GPUs via `vulkaninfo` and sets
-  `GGML_VK_VISIBLE_DEVICES`.
+- **Report generation** (`report`): JSONL to Markdown with ranked tables.
 
 ---
 
@@ -77,23 +92,41 @@ The CLI entry point `llama-bench` is installed automatically.
 
 | Requirement | Notes |
 |-------------|-------|
-| Python ≥ 3.10 | |
+| Python >= 3.10 | |
 | `llama-server` binary | Build from [llama.cpp](https://github.com/ggerganov/llama.cpp) |
 | A `.gguf` model file | Any GGUF-format model |
-| Vulkan drivers + `vulkaninfo` | Optional; enables GPU discovery |
+| Vulkan drivers + `vulkaninfo` | Optional; enables GPU discovery display |
 | `sudo` access | Required when `--sudo` is set (default) |
 
 ---
 
 ## Quick Start
 
-### Run the adaptive tuner
+### Run the adaptive tuner (Vulkan GPU, all devices)
 
 ```bash
 llama-bench bench --model /path/to/model.gguf
 ```
 
-Override the binary path and a few flags:
+### Run with a specific Vulkan device
+
+```bash
+llama-bench bench \
+  --model /path/to/model.gguf \
+  --engine vulkan \
+  --vk-devices 0
+```
+
+### Run on CPU only
+
+```bash
+llama-bench bench \
+  --model /path/to/model.gguf \
+  --engine cpu \
+  --n-gpu-layers 0
+```
+
+### Override the binary path and a few flags
 
 ```bash
 llama-bench bench \
@@ -117,6 +150,14 @@ llama-bench bench \
   --max-retries 3
 ```
 
+### Add TTFT gating (optional)
+
+```bash
+llama-bench bench \
+  --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --max-ttft-s 30.0
+```
+
 ### Run with verbose logging (no TUI)
 
 Use `-v` for INFO-level logs and `-vv` for DEBUG-level logs.  Both are written
@@ -128,29 +169,7 @@ llama-bench bench \
   -v --no-tui \
   --model /data/models/codellama-34b.Q5_K_M.gguf \
   --server /opt/llama.cpp/llama-server
-
-# DEBUG-level verbose, plain output
-llama-bench bench \
-  -vv --no-tui \
-  --model /data/models/codellama-34b.Q5_K_M.gguf \
-  --server /opt/llama.cpp/llama-server
-
-# DEBUG-level verbose with TUI (logs go to file only; TUI is shown in terminal)
-llama-bench bench \
-  -vv \
-  --model /data/models/codellama-34b.Q5_K_M.gguf \
-  --server /opt/llama.cpp/llama-server
 ```
-
-Verbose logs include:
-- Resolved server binary path
-- Version check result
-- Server start command, PID, and log file paths
-- Health-check polling progress
-- Each benchmark request with TTFT, end-to-end latency, and tok/s
-- Server log parsing summary
-
-The log file path is also recorded in each JSONL result entry as `log_file`.
 
 ### Generate a report
 
@@ -187,20 +206,20 @@ apply error handling on OOM, and emit ranked results.
 | `--threads` | `8` | CPU inference threads |
 | `--threads-batch` | `8` | CPU batch-processing threads |
 | `--split-mode` | `none` | GPU split mode (`none`/`layer`/`row`) |
-| `--vk-devices` | auto | `GGML_VK_VISIBLE_DEVICES` value |
+| `--engine` | `vulkan` | Inference engine: `vulkan` or `cpu` |
+| `--vk-devices` | *(all devices)* | Comma-separated Vulkan device indices for `GGML_VK_VISIBLE_DEVICES`. If omitted, env var is not set. |
 | `--sudo` / `--no-sudo` | `True` | Launch server with sudo |
 | `--ctx-min` | `8192` | Minimum context size to try |
-| `--ctx-max` | — | Maximum context size (defaults to `--ctx`) |
+| `--ctx-max` | -- | Maximum context size (defaults to `--ctx`) |
 | `--ctx-step` | `8192` | Context step between candidates |
 | `--ngl-step` | `4` | GPU-layers reduction step on OOM |
 | `--batch-step` | `256` | Batch-size reduction step on OOM |
 | `--max-retries` | `5` | Max retry attempts per candidate on OOM |
-| `--max-ttft` | `60.0` | Maximum acceptable TTFT (seconds) |
-| `--min-tokens-per-sec` | `1.0` | Minimum decode throughput (tokens/s) |
+| `--max-ttft-s` | *(disabled)* | Max acceptable TTFT (seconds). Disabled by default; TTFT recorded but does not gate usability. |
+| `--min-tokens-per-sec` | `4.0` | Minimum decode throughput (tokens/s) |
 | `--ctx-pct-threshold` | `0.90` | Fraction of max usable ctx for secondary throughput ranking |
 | `--output`, `-o` | auto | JSONL output path (default: `results/bench_<timestamp>.jsonl`) |
 | `--summary` | auto | Summary JSON path (default: `results/summary.json`) |
-| `--prompt-pack` | — | Custom prompt pack file (JSON/YAML) |
 | `--no-tui` | `False` | Disable TUI, use plain output |
 | `-v` / `--verbose` | off | Verbose logs to stderr + file (`-vv` for debug) |
 
@@ -266,11 +285,53 @@ the server under representative conditions:
    reduces `--n-gpu-layers` by `--ngl-step` and retries, up to `--max-retries`
    times.  If ngl hits the minimum, `--batch-size` is reduced by `--batch-step`
    before retrying.
-3. **Early stopping**: A configuration is abandoned if it fails, causes OOM beyond
-   the retry budget, or exceeds `--max-ttft`.
-4. **Multi-objective selection**: Results are ranked by max usable context, then
+3. **ctx big-step ladder**: When a memory-fit failure line reports that free memory
+   is less than 50% of projected usage, the context is halved (big step) for the
+   next retry instead of using the configured `--ctx-step`.  This avoids wasting
+   many retries when the model clearly cannot fit.
+4. **Early stopping**: A configuration is abandoned if it fails, causes OOM beyond
+   the retry budget, or falls below `--min-tokens-per-sec`.
+5. **Multi-objective selection**: Results are ranked by max usable context, then
    by throughput near that context level.  The `recommended` config balances
    both objectives.
+
+### Engine Selection and Mismatch Detection
+
+Pass `--engine vulkan` (default) to target Vulkan GPU acceleration, or
+`--engine cpu` for CPU-only inference.
+
+When `--engine vulkan` is active, llama-bench checks the server startup log for
+Vulkan backend lines (e.g. `ggml_vulkan: ...`).  If none are found — meaning the
+server binary was not built with Vulkan support or defaulted to a different
+backend — an **engine mismatch** is flagged:
+
+- In TUI mode: a **red** error entry is shown in the Errors panel.
+- In `--no-tui` mode: a red warning is printed to the console.
+- The `engine_mismatch` field is set to `true` in the JSONL result records.
+
+The run continues regardless; the warning is informational.
+
+### Usability Definition
+
+A configuration is *usable* when **all** of the following hold:
+
+- `tokens/s >= --min-tokens-per-sec` (default **4.0**)
+- `ttft_s <= --max-ttft-s` — only checked when `--max-ttft-s` is explicitly set;
+  **disabled by default** so TTFT alone never causes a rejection
+
+TTFT is always recorded and contributes to ranking between equal-context configs.
+
+### Terminal UI Panels
+
+The TUI (disabled by `--no-tui`) shows these panels:
+
+| Panel | Content |
+|-------|---------|
+| **To-Dos** | Remaining candidate configurations to test |
+| **Current State** | Configuration currently under test |
+| **Progress** | Progress bar with estimated time remaining |
+| **Errors / Warnings** | Errors in **red**, warnings in yellow |
+| **Results** | Rolling table of completed runs (tok/s, status, reason) |
 
 ### KV-Cache Prefix Reuse Probing
 
@@ -301,6 +362,7 @@ Each JSONL line contains:
   "config_hash": "abcd1234",
   "success": true,
   "failure_reason": null,
+  "engine_mismatch": false,
   "log_file": "results/llama_bench_20240101T120000.log",
   "client": {
     "ttft_ms": 142.3,
@@ -351,15 +413,6 @@ venv's `bin/` directory, causing a *"command not found"* error.
 sudo env PATH="$PATH" llama-bench bench --server /absolute/path/to/llama-server ...
 ```
 
-**Alternative — system-wide symlink:**
-
-```bash
-sudo ln -s "$(which llama-bench)" /usr/local/bin/llama-bench
-```
-
-After creating the symlink, plain `sudo llama-bench ...` works without the
-`env PATH=...` wrapper.
-
 **Best practice:** only the `llama-server` binary needs elevated privileges.
 `llama-bench` itself does not need to run as root; use `--sudo` (the default)
 so only the server subprocess is elevated, and invoke `llama-bench` as your
@@ -386,13 +439,6 @@ Only the **numeric build number** (e.g. `"8133"`) is extracted and compared agai
 Version warning: llama-server version mismatch: expected '8133', got '9000'.
 Results may differ from baseline.
 ```
-
-The `--server` path is **always resolved to an absolute path** before version
-detection runs, so `sudo: ./llama-server: command not found` errors can never
-be mis-parsed as a version string.
-
-To suppress the warning, update `EXPECTED_LLAMA_SERVER_VERSION` to match your
-build number (e.g. `"9000"`).
 
 The benchmark will still run regardless; the warning is informational only.
 
@@ -429,21 +475,16 @@ When a server startup failure occurs `llama-bench`:
 
 When `failure_reason` is `out_of_vram`, the tuner automatically backs off
 `--n-gpu-layers` by `--ngl-step` and retries the same context size, up to
-`--max-retries` times.  This means that an OOM failure at high `--n-gpu-layers`
-values will not abort the whole sweep — the tuner will find the highest ngl that
-fits in VRAM and continue.
+`--max-retries` times.
+
+When the server reports a fit-failure line (projected vs. free memory), the tuner
+uses a **big-step ladder**: if free memory is less than 50% of projected usage, the
+context is halved for the retry; otherwise a proportional reduction is applied.
 
 ### `model_not_found` is a critical failure
 
 If any attempt fails with `model_not_found`, the tuner exits immediately with
-an actionable error message and the path to the server stderr log:
-
-```
-Error: Critical error: model not found.
-  Server stderr log: results/server_stderr_20260101T120000.log
-  Excerpt:
-    gguf_init_from_file: failed to open GGUF file /bad/path.gguf (No such file or directory)
-```
+an actionable error message and the path to the server stderr log.
 
 ### Practical tips
 
@@ -452,10 +493,10 @@ Error: Critical error: model not found.
 * **`out_of_vram`** — reduce `--n-gpu-layers` starting value or widen the
   `--ngl-step` / `--max-retries` budget so the tuner has more room to adapt.
   Check free VRAM with `vulkaninfo | grep -i memory`.
-* **`server_exited`** — inspect the full stderr log printed in the error
-  message for clues.  Common culprits: wrong binary for the hardware (e.g.
-  CUDA binary on a Vulkan-only machine), missing Vulkan ICD.
+* **Engine mismatch warning** — the server binary does not have Vulkan support
+  compiled in, or the Vulkan ICD is missing.  Try `vulkaninfo` to check Vulkan
+  availability, or rebuild `llama-server` with Vulkan support.
+* **`server_exited`** — inspect the full stderr log for clues.  Common culprits:
+  wrong binary for the hardware, missing Vulkan ICD.
 * **`server_startup_timeout`** — the model may be loading from a slow storage
-  device.  The startup timeout is currently fixed at 90 seconds; if your
-  hardware is particularly slow, consider using a smaller model or faster
-  storage.
+  device.  The startup timeout is currently fixed at 90 seconds.
