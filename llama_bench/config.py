@@ -218,6 +218,10 @@ class BenchConfig:
     use_sudo: bool = True
     vk_visible_devices: Optional[str] = None  # None = don't set GGML_VK_VISIBLE_DEVICES
 
+    # Resolved device name(s) to pass as --device to llama-server.
+    # e.g. "Vulkan0,Vulkan1" or "none" (CPU). None = don't pass --device.
+    device: Optional[str] = None
+
     # Engine selection
     engine: str = "vulkan"  # "vulkan" | "cpu"
 
@@ -353,6 +357,7 @@ def configs_from_args(
     vk_devices: Optional[str] = None,
     use_sudo: bool = True,
     engine: str = "vulkan",
+    device: Optional[str] = None,
     **_kwargs: Any,
 ) -> BenchConfig:
     """Build a :class:`BenchConfig` from CLI keyword arguments."""
@@ -363,6 +368,7 @@ def configs_from_args(
         port=port,
         use_sudo=use_sudo,
         vk_visible_devices=vk_devices,
+        device=device,
         engine=engine,
         np=np,
         ctx=ctx,

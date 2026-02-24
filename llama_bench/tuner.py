@@ -217,6 +217,9 @@ class AdaptiveTuner:
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
         self.progress_cb = progress_cb
+        # Single consolidated server log files for the entire tuning run
+        self._server_log_stdout = os.path.join(artifacts_dir, "server_stdout.log")
+        self._server_log_stderr = os.path.join(artifacts_dir, "server_stderr.log")
 
     # ------------------------------------------------------------------
     # Public API
@@ -430,8 +433,13 @@ class AdaptiveTuner:
         prompt_seq: list[dict],
     ) -> TuneAttempt:
         """Run one server instance and return a :class:`TuneAttempt`."""
-        runner = BenchmarkRunner(cfg, artifacts_dir=self.artifacts_dir,
-                                 log_file=self.log_file)
+        runner = BenchmarkRunner(
+            cfg,
+            artifacts_dir=self.artifacts_dir,
+            log_file=self.log_file,
+            server_log_stdout=self._server_log_stdout,
+            server_log_stderr=self._server_log_stderr,
+        )
         run_metrics_list: list[RunMetrics] = runner.run_single(prompt_seq, n_followups=4)
 
         ts = datetime.now(timezone.utc).isoformat()
