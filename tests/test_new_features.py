@@ -192,7 +192,6 @@ class TestTtftGatingDisabled:
         tuner = self._make_tuner(max_ttft_s=10.0, min_tps=1.0)
         prompt_seq = [{"messages": [{"role": "user", "content": "hi"}]}]
         with patch.object(tuner, "_single_run") as mock_run:
-            from unittest.mock import patch as _patch
             mock_run.return_value = TuneAttempt(
                 config=tuner.base_cfg,
                 success=False,
