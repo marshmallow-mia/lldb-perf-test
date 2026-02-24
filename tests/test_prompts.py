@@ -1,12 +1,17 @@
 """Tests for llama_bench.prompts."""
+import os
 import pytest
 
 from llama_bench.prompts import (
+    CORPUS_FILES,
+    EXCLUDED_CORPUS_FILES,
     FOLLOWUP_QUESTIONS,
     REVERSE_ENGINEERING_SYSTEM_PROMPT,
     SHARED_PREFIX_TEMPLATE,
+    build_corpus_context,
     build_prompt_sequence,
     estimate_token_count,
+    load_corpus_files,
 )
 
 
@@ -109,3 +114,62 @@ def test_shared_prefix_contains_code():
 
 def test_followup_questions_count():
     assert len(FOLLOWUP_QUESTIONS) >= 6
+
+
+# ---------------------------------------------------------------------------
+# Corpus file loading
+# ---------------------------------------------------------------------------
+
+def test_corpus_files_constant():
+    """CORPUS_FILES must include README.md, agent.md, artifacts.md."""
+    assert "README.md" in CORPUS_FILES
+    assert "agent.md" in CORPUS_FILES
+    assert "artifacts.md" in CORPUS_FILES
+
+
+def test_excluded_corpus_files_constant():
+    """solution.md must be excluded from prompts."""
+    assert "solution.md" in EXCLUDED_CORPUS_FILES
+
+
+def test_load_corpus_files_from_repo(tmp_path):
+    """load_corpus_files returns dict with expected keys when files exist."""
+    # Create minimal corpus files in a temp dir that resembles a repo root
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
+    (tmp_path / "README.md").write_text("# Test README\n")
+    (tmp_path / "agent.md").write_text("# Agent context\n")
+    (tmp_path / "artifacts.md").write_text("# Binary artifacts\n")
+
+    corpus = load_corpus_files(repo_root=str(tmp_path))
+    assert "README.md" in corpus
+    assert "agent.md" in corpus
+    assert "artifacts.md" in corpus
+    assert "solution.md" not in corpus
+
+
+def test_load_corpus_files_skips_missing(tmp_path):
+    """load_corpus_files skips files that do not exist gracefully."""
+    corpus = load_corpus_files(repo_root=str(tmp_path))
+    # No corpus files in tmp_path; result should be empty
+    assert isinstance(corpus, dict)
+
+
+def test_build_corpus_context_returns_string():
+    ctx = build_corpus_context()
+    assert isinstance(ctx, str)
+    assert len(ctx) > 0
+
+
+def test_build_corpus_context_uses_fallback_when_no_files(tmp_path):
+    """Falls back to SHARED_PREFIX_TEMPLATE when corpus files are missing."""
+    ctx = build_corpus_context(repo_root=str(tmp_path))
+    # Should fall back gracefully (either use template or empty dir content)
+    assert isinstance(ctx, str)
+    assert len(ctx) > 0
+
+
+def test_solution_md_not_in_corpus():
+    """solution.md must NOT appear in the prompt corpus context."""
+    ctx = build_corpus_context()
+    # The text 'solution.md' should not appear as a section header in the corpus
+    assert "=== solution.md ===" not in ctx

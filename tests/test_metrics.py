@@ -7,6 +7,7 @@ from llama_bench.metrics import (
     classify_failure,
     classify_server_stderr,
     extract_server_error_excerpt,
+    parse_memory_fit_heuristic,
     parse_server_log,
     score_run,
 )
@@ -145,22 +146,32 @@ def test_score_run_failure():
 
 
 # ---------------------------------------------------------------------------
-# classify_server_stderr
+# classify_server_stderr — updated patterns per spec
 # ---------------------------------------------------------------------------
 
-# Fixture lines from problem statement
-_MODEL_NOT_FOUND_LINES = [
-    "gguf_init_from_file: failed to open GGUF file /path/to/model.gguf (No such file or directory)",
-    "srv    load_model: failed to load model, '/path/to/model.gguf'",
-    "common_init_from_params: failed to load model '/path/to/model.gguf'",
-    "llama_model_load: error loading model:",
-]
-
+# Lines that must classify as out_of_vram (checked before model_not_found)
 _OUT_OF_VRAM_LINES = [
-    "ggml_vulkan: Device memory allocation of size 1234567890 failed.",
     "vk::Device::allocateMemory: ErrorOutOfDeviceMemory",
+    "ErrorOutOfDeviceMemory",
+    "ggml_vulkan: Device memory allocation of size 1234567890 failed.",
+    "Device memory allocation of size 9999 failed",
     "failed to allocate Vulkan0 buffer",
     "unable to allocate Vulkan0 buffer",
+    "failed to fit params to free device memory",
+]
+
+# Lines that must classify as model_not_found (missing-file patterns only)
+_MODEL_NOT_FOUND_LINES = [
+    "gguf_init_from_file: failed to open GGUF file /path/to/model.gguf (No such file or directory)",
+    "error: failed to open GGUF file model.gguf",
+    "fatal: No such file or directory: /tmp/model.gguf",
+]
+
+# Lines that should fall through to server_exited (no specific match)
+_SERVER_EXITED_LINES = [
+    "some unrecognised log line",
+    "",
+    "srv    load_model: failed to load model, '/path/to/model.gguf'",
     "main: exiting due to model loading error",
 ]
 
@@ -168,26 +179,29 @@ _OUT_OF_VRAM_LINES = [
 class TestClassifyServerStderr:
     """Unit tests for classify_server_stderr using problem-statement fixtures."""
 
-    @pytest.mark.parametrize("line", _MODEL_NOT_FOUND_LINES)
-    def test_model_not_found(self, line):
-        assert classify_server_stderr(line) == "model_not_found"
-
     @pytest.mark.parametrize("line", _OUT_OF_VRAM_LINES)
     def test_out_of_vram(self, line):
         assert classify_server_stderr(line) == "out_of_vram"
 
-    def test_unknown_stderr_returns_server_exited(self):
-        assert classify_server_stderr("some unrecognised log line") == "server_exited"
+    @pytest.mark.parametrize("line", _MODEL_NOT_FOUND_LINES)
+    def test_model_not_found(self, line):
+        assert classify_server_stderr(line) == "model_not_found"
 
-    def test_empty_stderr_returns_server_exited(self):
-        assert classify_server_stderr("") == "server_exited"
+    @pytest.mark.parametrize("line", _SERVER_EXITED_LINES)
+    def test_server_exited_fallback(self, line):
+        assert classify_server_stderr(line) == "server_exited"
 
-    def test_model_not_found_takes_priority_over_model_loading_error(self):
-        # Both patterns present; model_not_found should win (listed first)
+    def test_out_of_vram_takes_priority_over_model_not_found(self):
+        """out_of_vram is checked first (higher priority)."""
         text = (
             "gguf_init_from_file: failed to open GGUF file x.gguf (No such file or directory)\n"
-            "main: exiting due to model loading error\n"
+            "failed to fit params to free device memory\n"
         )
+        assert classify_server_stderr(text) == "out_of_vram"
+
+    def test_model_not_found_without_oom(self):
+        """model_not_found returned when only missing-file patterns present."""
+        text = "gguf_init_from_file: failed to open GGUF file x.gguf (No such file or directory)\n"
         assert classify_server_stderr(text) == "model_not_found"
 
     def test_multiline_oom_log(self):
@@ -195,6 +209,13 @@ class TestClassifyServerStderr:
             "ggml_vulkan: initialising...\n"
             "ggml_vulkan: Device memory allocation of size 4294967296 failed.\n"
             "vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n"
+        )
+        assert classify_server_stderr(log) == "out_of_vram"
+
+    def test_fit_failure_classified_as_out_of_vram(self):
+        log = (
+            "llama_params_fit_impl: projected to use 12345 MiB, 9876 MiB free\n"
+            "failed to fit params to free device memory\n"
         )
         assert classify_server_stderr(log) == "out_of_vram"
 
@@ -218,3 +239,47 @@ class TestExtractServerErrorExcerpt:
 
     def test_empty_text_returns_empty(self):
         assert extract_server_error_excerpt("") == ""
+
+
+# ---------------------------------------------------------------------------
+# parse_memory_fit_heuristic
+# ---------------------------------------------------------------------------
+
+class TestParseMemoryFitHeuristic:
+    """Unit tests for the ctx adjustment heuristic parser."""
+
+    def test_parses_standard_fit_line(self):
+        log = "llama_params_fit_impl: projected to use 12345 MiB, 9876 MiB free\n"
+        result = parse_memory_fit_heuristic(log)
+        assert result is not None
+        projected, free = result
+        assert abs(projected - 12345.0) < 0.1
+        assert abs(free - 9876.0) < 0.1
+
+    def test_parses_with_extra_text_on_line(self):
+        log = (
+            "llama_params_fit_impl: model requires projected to use 8192.5 MiB "
+            "of device memory, but only 4096.0 MiB free\n"
+        )
+        result = parse_memory_fit_heuristic(log)
+        assert result is not None
+        projected, free = result
+        assert abs(projected - 8192.5) < 0.1
+        assert abs(free - 4096.0) < 0.1
+
+    def test_returns_none_when_no_fit_line(self):
+        log = "Some other server log without fit info\n"
+        assert parse_memory_fit_heuristic(log) is None
+
+    def test_returns_none_on_empty_string(self):
+        assert parse_memory_fit_heuristic("") is None
+
+    def test_picks_first_match_in_multiline(self):
+        log = (
+            "llama_params_fit_impl: projected to use 10000 MiB, 5000 MiB free\n"
+            "llama_params_fit_impl: projected to use 20000 MiB, 3000 MiB free\n"
+        )
+        result = parse_memory_fit_heuristic(log)
+        assert result is not None
+        projected, _ = result
+        assert abs(projected - 10000.0) < 0.1

@@ -2,9 +2,70 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import yaml
+
+
+# ---------------------------------------------------------------------------
+# Corpus file loading
+# ---------------------------------------------------------------------------
+
+def _find_repo_root() -> "str | None":
+    """Walk up from this file's directory looking for pyproject.toml."""
+    current = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(10):
+        if os.path.exists(os.path.join(current, "pyproject.toml")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+# Files that MUST be included in the prompt corpus (in order).
+CORPUS_FILES = ("README.md", "agent.md", "artifacts.md")
+
+# solution.md is intentionally excluded from prompts.
+EXCLUDED_CORPUS_FILES = ("solution.md",)
+
+
+def load_corpus_files(repo_root: "str | None" = None) -> "dict[str, str]":
+    """Load the prompt corpus files from the repository root.
+
+    Returns a dict mapping filename → content for each file that exists.
+    Files listed in :data:`EXCLUDED_CORPUS_FILES` are never loaded.
+    """
+    root = repo_root or _find_repo_root()
+    if root is None:
+        return {}
+    result: dict[str, str] = {}
+    for name in CORPUS_FILES:
+        path = os.path.join(root, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                result[name] = fh.read()
+        except OSError:
+            pass
+    return result
+
+
+def build_corpus_context(repo_root: "str | None" = None) -> str:
+    """Return a concatenated context string from all corpus files.
+
+    Falls back to the built-in :data:`SHARED_PREFIX_TEMPLATE` when the
+    corpus files cannot be located (e.g. in tests running outside the repo).
+    """
+    corpus = load_corpus_files(repo_root)
+    parts: list[str] = []
+    for name in CORPUS_FILES:
+        if name in corpus:
+            parts.append(f"=== {name} ===\n{corpus[name]}")
+    if parts:
+        return "\n\n".join(parts)
+    return SHARED_PREFIX_TEMPLATE
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +237,24 @@ def estimate_token_count(text: str) -> int:
 def build_prompt_sequence(n_followups: int = 4, use_system: bool = True) -> list[dict]:
     """Build a list of message-sequence dicts for the benchmark.
 
-    The first item is the initial turn (system + shared prefix + opening question).
-    Subsequent items are follow-ups that re-include the shared prefix (simulating
+    The first item is the initial turn (system + corpus context + opening question).
+    Subsequent items are follow-ups that re-include the corpus context (simulating
     a real multi-turn session with prefix cache reuse).
+
+    The corpus context is loaded from the repository prompt files
+    (``README.md``, ``agent.md``, ``artifacts.md``).  When those files are not
+    accessible, the built-in :data:`SHARED_PREFIX_TEMPLATE` is used as a
+    fallback so that the function remains usable in all environments.
 
     Each dict has:
       - ``"messages"``: list of ``{"role": str, "content": str}``
       - ``"is_followup"``: bool
       - ``"expected_prefix_len_tokens"``: int (rough estimate)
     """
+    shared_context = build_corpus_context()
+
     initial_content = (
-        SHARED_PREFIX_TEMPLATE
+        shared_context
         + "\n\nWhat does this function do? Provide a detailed analysis including "
         "the purpose, data flow, and any security implications."
     )
@@ -196,7 +264,7 @@ def build_prompt_sequence(n_followups: int = 4, use_system: bool = True) -> list
         messages_initial.append({"role": "system", "content": REVERSE_ENGINEERING_SYSTEM_PROMPT})
     messages_initial.append({"role": "user", "content": initial_content})
 
-    prefix_tokens = estimate_token_count(SHARED_PREFIX_TEMPLATE)
+    prefix_tokens = estimate_token_count(shared_context)
 
     sequence: list[dict] = [
         {
@@ -209,8 +277,8 @@ def build_prompt_sequence(n_followups: int = 4, use_system: bool = True) -> list
     # Reuse questions (cycle if n_followups > len(FOLLOWUP_QUESTIONS))
     for i in range(n_followups):
         question = FOLLOWUP_QUESTIONS[i % len(FOLLOWUP_QUESTIONS)]
-        # Include shared prefix again to simulate cache reuse
-        combined = SHARED_PREFIX_TEMPLATE + "\n\n" + question
+        # Include shared context again to simulate cache reuse
+        combined = shared_context + "\n\n" + question
         followup_messages = list(messages_initial) + [
             {"role": "user", "content": combined}
         ]
