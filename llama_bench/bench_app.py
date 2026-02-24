@@ -795,7 +795,20 @@ class BenchApp(App):
             self._activity(f"▷  ctx={ctx}  ngl={ngl}  batch={batch}  — {phase}")
 
         elif event == "retry":
-            pass
+            attempt = data.get("attempt", "?")
+            max_r = data.get("max_retries", "?")
+            reason_label = _REASON_LABELS.get(data.get("reason", ""), data.get("reason", "?"))
+            change = data.get("change", "?")
+            ctx = data.get("ctx", "")
+            ngl = data.get("ngl", "")
+            batch = data.get("batch", "")
+            msg = (
+                f"#{attempt}/{max_r} — {reason_label}  →  {change}\n"
+                f"  ctx={ctx} ngl={ngl} batch={batch}"
+            )
+            s.retry_log.append(msg)
+            self.query_one(RetriesWidget).refresh_content(s.retry_log)
+            self._activity(f"⟳  #{attempt}/{max_r}  {reason_label}  →  {change}")
         elif event == "hall_of_fame":
             s.hall_of_fame = dict(data)
             self.query_one(HallOfFameWidget).refresh_content(s.hall_of_fame)

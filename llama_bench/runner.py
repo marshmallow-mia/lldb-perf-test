@@ -9,7 +9,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -166,6 +166,7 @@ def wait_for_server_ready(
     port: int,
     timeout: float = 60.0,
     proc: Optional[subprocess.Popen] = None,
+    event_cb: Optional[Callable] = None,
 ) -> Optional[str]:
     """Poll ``GET /health`` until 200 OK or *timeout* seconds elapse.
 
@@ -186,6 +187,8 @@ def wait_for_server_ready(
             return "server_exited"
 
         attempt += 1
+        if event_cb is not None and attempt % 10 == 0:
+            event_cb("health_poll", {"attempt": attempt, "elapsed_s": float(attempt)})
         try:
             resp = requests.get(url, timeout=2.0)
             if resp.status_code == 200:
@@ -298,14 +301,21 @@ class BenchmarkRunner:
 
     def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results",
                  log_file: Optional[str] = None,
-                 max_tokens: int = 512) -> None:
+                 max_tokens: int = 512,
+                 event_cb: Optional[Callable[[str, dict], None]] = None) -> None:
         self.cfg = cfg
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
         self.max_tokens = max_tokens
+        self._event_cb = event_cb
         os.makedirs(artifacts_dir, exist_ok=True)
 
-
+    def _emit(self, event: str, **data: object) -> None:
+        if self._event_cb is not None:
+            try:
+                self._event_cb(event, dict(data))
+            except Exception:
+                pass
 
     def run_single(
         self,
@@ -319,11 +329,14 @@ class BenchmarkRunner:
         try:
             handle = start_server(self.cfg, self.artifacts_dir)
             logger.info("Server command: %s", " ".join(_build_server_cmd(self.cfg)))
+            cmd_str = " ".join(_build_server_cmd(self.cfg))
+            self._emit("server_starting", command=cmd_str, stderr_path=handle.stderr_path, pid=handle.pid)
             logger.info("Starting server for run (config_hash will be assigned per-prompt)")
             logger.info("Waiting for server to become ready (timeout=90s)")
             startup_failure = wait_for_server_ready(
                 self.cfg.host, self.cfg.port, timeout=90.0,
                 proc=handle.process,
+                event_cb=lambda ev, d: self._emit(ev, **d),
             )
 
             if startup_failure is not None:
@@ -354,6 +367,7 @@ class BenchmarkRunner:
                 )
                 return results
 
+            self._emit("server_ready")
             for idx, item in enumerate(prompt_sequence):
                 messages = item.get("messages", [])
                 run_id = _make_run_id(self.cfg)
@@ -366,6 +380,7 @@ class BenchmarkRunner:
                     step_label = f"Follow-up {idx}/{total_prompts - 1}"
                 logger.info("Benchmark request %d/%d run_id=%s", idx + 1, total_prompts, run_id)
 
+                self._emit("request_step", step=step_label, idx=idx, total=total_prompts)
                 try:
                     # Run streaming request
                     logger.debug("Starting streaming request (prompt messages=%d)", len(messages))
