@@ -300,12 +300,14 @@ class BenchmarkRunner:
     def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results",
                  log_file: Optional[str] = None,
                  server_log_stdout: Optional[str] = None,
-                 server_log_stderr: Optional[str] = None) -> None:
+                 server_log_stderr: Optional[str] = None,
+                 max_tokens: int = 512) -> None:
         self.cfg = cfg
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
         self.server_log_stdout = server_log_stdout
         self.server_log_stderr = server_log_stderr
+        self.max_tokens = max_tokens
         os.makedirs(artifacts_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -461,7 +463,7 @@ class BenchmarkRunner:
         payload = {
             "messages": messages,
             "stream": True,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         start = time.monotonic()
         ttft_ms = 0.0

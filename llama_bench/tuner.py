@@ -210,6 +210,7 @@ class AdaptiveTuner:
         artifacts_dir: str = "results",
         log_file: Optional[str] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
+        max_tokens: int = 512,
     ) -> None:
         self.base_cfg = base_cfg
         self.bounds = bounds
@@ -217,6 +218,7 @@ class AdaptiveTuner:
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
         self.progress_cb = progress_cb
+        self.max_tokens = max_tokens
         # Single consolidated server log files for the entire tuning run
         self._server_log_stdout = os.path.join(artifacts_dir, "server_stdout.log")
         self._server_log_stderr = os.path.join(artifacts_dir, "server_stderr.log")
@@ -439,6 +441,7 @@ class AdaptiveTuner:
             log_file=self.log_file,
             server_log_stdout=self._server_log_stdout,
             server_log_stderr=self._server_log_stderr,
+            max_tokens=self.max_tokens,
         )
         run_metrics_list: list[RunMetrics] = runner.run_single(prompt_seq, n_followups=4)
 
