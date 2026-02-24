@@ -106,7 +106,16 @@ def _print_validation(cfg) -> None:
 @click.group()
 @click.version_option("0.1.0", prog_name="llama-bench")
 def main() -> None:
-    """llama-bench: benchmarking and optimizer CLI for llama.cpp llama-server."""
+    """llama-bench: adaptive configuration tuner for llama.cpp llama-server.
+
+    Use the 'bench' command to run the reverse-engineering workload tuning loop.
+    It iterates context-size and GPU-layer combinations, applies adaptive error
+    handling on VRAM OOM, and emits a ranked JSONL + summary.json of usable configs.
+
+    Example:
+
+        llama-bench bench --model /path/to/model.gguf
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +366,7 @@ def _print_tuner_summary(selection: dict) -> None:
 # search command
 # ---------------------------------------------------------------------------
 
-@main.command()
+@main.command(hidden=True, deprecated=True)
 @click.option("--server", "-s", default="./llama-server", show_default=True,
               help="Path to llama-server binary.")
 @click.option("--model", "-m", required=True, help="Path to model file (.gguf).")
@@ -400,7 +409,7 @@ def search(
     vk_devices, sudo,
     np_tests, ctx_tests, ngl_tests, max_configs, output, no_tui, verbosity,
 ) -> None:
-    """Run a staged parameter search over the search space."""
+    """Deprecated: use 'bench' instead. Run a staged parameter search over the search space."""
     from llama_bench.config import (
         SearchSpace,
         configs_from_args,
