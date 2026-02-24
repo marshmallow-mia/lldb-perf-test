@@ -171,5 +171,8 @@ def test_build_corpus_context_uses_fallback_when_no_files(tmp_path):
 def test_solution_md_not_in_corpus():
     """solution.md must NOT appear in the prompt corpus context."""
     ctx = build_corpus_context()
-    # The text 'solution.md' should not appear as a section header in the corpus
+    # The section header must not appear
     assert "=== solution.md ===" not in ctx
+    # Unique content from solution.md (Vulnerability Summary header) must not appear
+    assert "Vulnerability Summary" not in ctx
+    assert "CVE-candidate" not in ctx

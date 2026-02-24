@@ -376,7 +376,7 @@ class AdaptiveTuner:
             projected_mib, free_mib = fit
             if projected_mib > 0 and free_mib < projected_mib:
                 ratio = free_mib / projected_mib
-                new_ctx = int(cfg.ctx * ratio * 0.90)  # 10% safety margin
+                new_ctx = int(cfg.ctx * ratio * 0.90)  # reduce by 10% extra to give headroom
                 # Round down to ctx_step boundary
                 new_ctx = (new_ctx // self.bounds.ctx_step) * self.bounds.ctx_step
                 logger.debug(
