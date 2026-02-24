@@ -517,8 +517,6 @@ class AdaptiveTuner:
         runner = BenchmarkRunner(cfg, artifacts_dir=self.artifacts_dir,
             log_file=self.log_file,
             max_tokens=self.max_tokens,
-            event_cb=self.event_cb,
-            stop_event=self.stop_event,
         )
         run_metrics_list: list[RunMetrics] = runner.run_single(prompt_seq, n_followups=self.n_followups)
 
