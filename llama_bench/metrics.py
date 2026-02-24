@@ -148,19 +148,18 @@ def parse_server_log(log_text: str) -> Optional[ServerMetrics]:
 # ---------------------------------------------------------------------------
 
 # Ordered list of (reason, pattern) pairs; first match wins.
+# Priority: out_of_vram before model_not_found (per spec).
 _STARTUP_FAILURE_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("model_not_found", re.compile(
-        r"gguf_init_from_file: failed to open"
-        r"|srv\s+load_model: failed to load model"
-        r"|common_init_from_params: failed to load model"
-        r"|llama_model_load: error loading model",
+    ("out_of_vram", re.compile(
+        r"ErrorOutOfDeviceMemory"
+        r"|Device memory allocation .* failed"
+        r"|(?:failed|unable) to allocate Vulkan\d+ buffer"
+        r"|failed to fit params to free device memory",
         re.IGNORECASE,
     )),
-    ("out_of_vram", re.compile(
-        r"ggml_vulkan: Device memory allocation of size .* failed"
-        r"|vk::Device::allocateMemory: ErrorOutOfDeviceMemory"
-        r"|(?:failed|unable) to allocate Vulkan\d+ buffer"
-        r"|main: exiting due to model loading error",
+    ("model_not_found", re.compile(
+        r"failed to open GGUF file"
+        r"|No such file or directory",
         re.IGNORECASE,
     )),
 ]
@@ -188,6 +187,29 @@ def extract_server_error_excerpt(stderr_text: str, max_lines: int = 5) -> str:
     error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in _ERROR_KEYWORDS)]
     excerpt = error_lines[-max_lines:] if error_lines else lines[-max_lines:]
     return "\n".join(excerpt)
+
+
+# Pattern for llama.cpp fit-failure memory lines:
+# "llama_params_fit_impl: projected to use 12345 MiB, 9876 MiB free"
+_RE_FIT_MEMORY = re.compile(
+    r"llama_params_fit_impl:.*?projected to use\s+([\d.]+)\s*MiB.*?(\d[\d.]*)\s*MiB\s*free",
+    re.IGNORECASE,
+)
+
+
+def parse_memory_fit_heuristic(stderr_text: str) -> "Optional[tuple[float, float]]":
+    """Parse projected vs free memory from a llama.cpp fit-failure line.
+
+    Looks for lines of the form::
+
+        llama_params_fit_impl: projected to use X MiB ... Y MiB free
+
+    Returns ``(projected_mib, free_mib)`` when a match is found, otherwise ``None``.
+    """
+    m = _RE_FIT_MEMORY.search(stderr_text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return None
 
 
 # ---------------------------------------------------------------------------

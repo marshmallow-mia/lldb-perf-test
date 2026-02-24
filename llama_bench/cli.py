@@ -120,7 +120,8 @@ def main() -> None:
 @click.option("--host", default="0.0.0.0", show_default=True, help="Server host.")
 @click.option("--port", "-p", default=5001, show_default=True, help="Server port.")
 @click.option("--np", default=1, show_default=True, help="Number of parallel slots.")
-@click.option("--ctx", "-c", default=49152, show_default=True, help="Context size (tokens).")
+@click.option("--ctx", "-c", default=49152, show_default=True,
+              help="Starting context size (tokens); used as ctx_max if --ctx-max not set.")
 @click.option("--n-gpu-layers", "-ngl", "n_gpu_layers", default=45, show_default=True,
               help="Layers to offload to GPU.")
 @click.option("--flash-attn/--no-flash-attn", default=True, show_default=True,
@@ -143,10 +144,31 @@ def main() -> None:
               help="GGML_VK_VISIBLE_DEVICES value (auto-discover if omitted).")
 @click.option("--sudo/--no-sudo", default=True, show_default=True,
               help="Launch server with sudo.")
-@click.option("--n-followups", default=4, show_default=True,
-              help="Number of follow-up prompts per run.")
+# --- Tuner bounds ---
+@click.option("--ctx-min", default=8192, show_default=True,
+              help="Minimum context size to try.")
+@click.option("--ctx-max", default=None, type=int,
+              help="Maximum context size to try (defaults to --ctx value).")
+@click.option("--ctx-step", default=8192, show_default=True,
+              help="Context step size between candidates.")
+@click.option("--ngl-step", default=4, show_default=True,
+              help="n-gpu-layers reduction step on OOM.")
+@click.option("--batch-step", default=256, show_default=True,
+              help="batch-size reduction step on OOM.")
+@click.option("--max-retries", default=5, show_default=True,
+              help="Max retry attempts per candidate config on OOM.")
+# --- Performance thresholds ---
+@click.option("--max-ttft", default=60.0, show_default=True,
+              help="Maximum acceptable TTFT in seconds.")
+@click.option("--min-tokens-per-sec", default=1.0, show_default=True,
+              help="Minimum acceptable decode throughput (tokens/s).")
+@click.option("--ctx-pct-threshold", default=0.90, show_default=True,
+              help="Fraction of max usable ctx for secondary throughput ranking.")
+# --- Output ---
 @click.option("--output", "-o", default=None,
               help="JSONL output path (default: results/bench_<timestamp>.jsonl).")
+@click.option("--summary", default=None,
+              help="Summary JSON path (default: results/summary.json).")
 @click.option("--prompt-pack", default=None, type=click.Path(exists=True),
               help="Path to a custom prompt pack (JSON/YAML).")
 @click.option("--no-tui", is_flag=True, default=False, help="Disable TUI, use plain output.")
@@ -156,19 +178,28 @@ def bench(
     server, model, host, port, np, ctx, n_gpu_layers, flash_attn,
     batch_size, ubatch_size, cache_type_k, cache_type_v, kv_unified,
     cache_reuse, cont_batching, threads, threads_batch, split_mode,
-    vk_devices, sudo, n_followups, output, prompt_pack, no_tui, verbosity,
+    vk_devices, sudo,
+    ctx_min, ctx_max, ctx_step, ngl_step, batch_step, max_retries,
+    max_ttft, min_tokens_per_sec, ctx_pct_threshold,
+    output, summary, prompt_pack, no_tui, verbosity,
 ) -> None:
-    """Run a single benchmark configuration."""
+    """Adaptive configuration tuner: find the highest usable context for your model.
+
+    Iterates through multiple configurations automatically, adjusts parameters
+    on VRAM OOM / fit failures, and emits a ranked summary of usable configs.
+    """
+    import json as _json
     from llama_bench.config import configs_from_args
-    from llama_bench.metrics import metrics_to_dict
-    from llama_bench.prompts import build_prompt_sequence, load_prompt_pack
-    from llama_bench.report import print_summary_table
-    from llama_bench.runner import BenchmarkRunner
     from llama_bench.logging_setup import setup_logging
+    from llama_bench.prompts import build_prompt_sequence, load_prompt_pack
+    from llama_bench.tuner import (
+        AdaptiveTuner, TunerBounds, TunerThresholds, select_best_configs, write_summary_json,
+    )
 
     output_path = output or _default_output()
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    log_file = setup_logging(verbosity, os.path.dirname(os.path.abspath(output_path)))
+    artifacts_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(artifacts_dir, exist_ok=True)
+    log_file = setup_logging(verbosity, artifacts_dir)
     if log_file:
         console.print(f"[dim]Verbose log: {log_file}[/]")
 
@@ -181,67 +212,145 @@ def bench(
 
     _check_version(server, sudo)
 
-    cfg = configs_from_args(
-        server=server, model=model, host=host, port=port, np=np, ctx=ctx,
+    # Use --ctx as the starting/max context if --ctx-max not explicitly provided
+    effective_ctx_max = ctx_max if ctx_max is not None else ctx
+
+    base_cfg = configs_from_args(
+        server=server, model=model, host=host, port=port, np=np, ctx=effective_ctx_max,
         n_gpu_layers=n_gpu_layers, flash_attn=flash_attn, batch_size=batch_size,
         ubatch_size=ubatch_size, cache_type_k=cache_type_k, cache_type_v=cache_type_v,
         kv_unified=kv_unified, cache_reuse=cache_reuse, cont_batching=cont_batching,
         threads=threads, threads_batch=threads_batch, split_mode=split_mode,
         vk_devices=vk_devices, use_sudo=sudo,
     )
-    _print_validation(cfg)
+    _print_validation(base_cfg)
 
-    if prompt_pack:
-        prompt_seq = load_prompt_pack(prompt_pack)
-    else:
-        prompt_seq = build_prompt_sequence(n_followups=n_followups)
+    bounds = TunerBounds(
+        ctx_min=ctx_min,
+        ctx_max=effective_ctx_max,
+        ctx_step=ctx_step,
+        ngl_step=ngl_step,
+        batch_step=batch_step,
+        max_retries=max_retries,
+    )
+    thresholds = TunerThresholds(
+        max_ttft_s=max_ttft,
+        min_tokens_per_sec=min_tokens_per_sec,
+    )
 
-    runner = BenchmarkRunner(cfg, artifacts_dir=os.path.dirname(os.path.abspath(output_path)),
-                             log_file=log_file)
+    summary_path = summary or os.path.join(artifacts_dir, "summary.json")
 
-    console.print(f"[bold]Running benchmark[/] → {output_path}")
+    console.print(
+        f"[bold]Tuner sweep[/] ctx {effective_ctx_max}→{ctx_min} step {ctx_step} "
+        f"| max_retries={max_retries} | output → {output_path}"
+    )
+
+    def _plain_progress(current: int, total: int) -> None:
+        console.print(f"[dim]  [{current}/{total}][/]")
 
     if no_tui:
-        run_metrics = runner.run_single(prompt_seq, n_followups=n_followups)
+        tuner = AdaptiveTuner(
+            base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
+            artifacts_dir=artifacts_dir, log_file=log_file,
+            progress_cb=_plain_progress,
+        )
+        attempts = tuner.run()
     else:
         from llama_bench.tui import BenchTUI
+        total_candidates = max(
+            1, (effective_ctx_max - ctx_min) // ctx_step + 1
+        )
         with BenchTUI() as tui:
-            tui.update_progress(0, 1, 1, "benchmark")
-            run_metrics = runner.run_single(prompt_seq, n_followups=n_followups)
-            for m in run_metrics:
-                from llama_bench.metrics import score_run
-                sc = score_run(m)
-                tui.add_result(m.run_id, f"np={cfg.np}, ctx={cfg.ctx}", sc, m.success,
-                               m.failure_reason)
-            tui.update_progress(1, 1, 1, "benchmark")
+            def _tui_progress(current: int, total: int) -> None:
+                tui.update_progress(current, total, 1, "tuner sweep")
 
-    # Save JSONL
-    import json
+            tuner = AdaptiveTuner(
+                base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
+                artifacts_dir=artifacts_dir, log_file=log_file,
+                progress_cb=_tui_progress,
+            )
+            attempts = tuner.run()
+
+            for a in attempts:
+                score = a.ttft_s * 1000.0 if a.success else float("inf")
+                tui.add_result(
+                    a.run_id,
+                    f"ctx={a.ctx} ngl={a.n_gpu_layers} batch={a.batch_size}",
+                    score, a.success, a.failure_reason,
+                )
+
+    # Write JSONL
+    from llama_bench.tuner import _attempt_to_dict as _atd
     with open(output_path, "w", encoding="utf-8") as fh:
-        for m in run_metrics:
-            fh.write(json.dumps(metrics_to_dict(m)) + "\n")
+        for a in attempts:
+            fh.write(_json.dumps(_atd(a)) + "\n")
 
     console.print(f"[green]Results saved to[/] {output_path}")
 
-    # Fail fast for startup errors in bench mode (model not found / OOM VRAM).
-    _STARTUP_FAILURE_REASONS = {"model_not_found", "out_of_vram", "server_exited", "server_startup_timeout"}
-    if run_metrics and not run_metrics[0].success and run_metrics[0].failure_reason in _STARTUP_FAILURE_REASONS:
-        import textwrap
-        m = run_metrics[0]
-        stderr_hint = f"\n  Server stderr log: {m.stderr_path}" if m.stderr_path else ""
-        if m.server_error_excerpt:
-            indented = textwrap.indent(m.server_error_excerpt, "    ")
-            excerpt_hint = f"\n  Excerpt:\n{indented}"
-        else:
-            excerpt_hint = ""
-        raise click.ClickException(
-            f"Server startup failed ({m.failure_reason}).{stderr_hint}{excerpt_hint}"
-        )
+    # Multi-objective selection
+    selection = select_best_configs(attempts, ctx_pct_threshold=ctx_pct_threshold)
+    write_summary_json(summary_path, attempts, selection)
+    console.print(f"[green]Summary written to[/] {summary_path}")
 
-    # Print summary
-    from llama_bench.report import load_results
-    loaded = load_results(output_path)
-    print_summary_table(loaded)
+    # Print final TUI summary
+    _print_tuner_summary(selection)
+
+    # Abort on critical errors (abort run if no usable configs found due to model not found)
+    for a in attempts:
+        if a.failure_reason == "model_not_found":
+            import textwrap
+            stderr_hint = f"\n  Server stderr log: {a.stderr_path}" if a.stderr_path else ""
+            if a.server_error_excerpt:
+                indented = textwrap.indent(a.server_error_excerpt, "    ")
+                excerpt_hint = f"\n  Excerpt:\n{indented}"
+            else:
+                excerpt_hint = ""
+            raise click.ClickException(
+                f"Critical error: model not found.{stderr_hint}{excerpt_hint}"
+            )
+
+
+def _print_tuner_summary(selection: dict) -> None:
+    """Print a Rich table summarising the tuner multi-objective selection."""
+    from rich.table import Table
+
+    max_ctx = selection.get("max_ctx_result")
+    top = selection.get("top_throughput", [])
+    recommended = selection.get("recommended")
+
+    if max_ctx is None:
+        console.print("[yellow]No usable configurations found.[/]")
+        return
+
+    console.print(f"\n[bold green]Max usable context:[/] {max_ctx.ctx} tokens "
+                  f"(ngl={max_ctx.n_gpu_layers}, batch={max_ctx.batch_size}, "
+                  f"tok/s={max_ctx.tokens_per_sec:.1f})")
+
+    if top:
+        table = Table(title="Top throughput configs near max ctx", show_lines=False)
+        table.add_column("Rank", justify="right")
+        table.add_column("ctx", justify="right")
+        table.add_column("ngl", justify="right")
+        table.add_column("batch", justify="right")
+        table.add_column("tok/s", justify="right")
+        table.add_column("TTFT (s)", justify="right")
+        for rank, a in enumerate(top, 1):
+            table.add_row(
+                str(rank),
+                str(a.ctx),
+                str(a.n_gpu_layers),
+                str(a.batch_size),
+                f"{a.tokens_per_sec:.1f}",
+                f"{a.ttft_s:.2f}",
+            )
+        console.print(table)
+
+    if recommended:
+        console.print(
+            f"\n[bold cyan]Recommended stable config:[/] "
+            f"ctx={recommended.ctx} ngl={recommended.n_gpu_layers} "
+            f"batch={recommended.batch_size} tok/s={recommended.tokens_per_sec:.1f}"
+        )
 
 
 # ---------------------------------------------------------------------------
