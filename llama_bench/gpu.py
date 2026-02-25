@@ -5,10 +5,10 @@ import logging
 import os
 import re
 import subprocess
+
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
 
 def discover_vulkan_gpus() -> list[dict]:
     """Probe the host for Vulkan-capable GPUs via ``vulkaninfo``.

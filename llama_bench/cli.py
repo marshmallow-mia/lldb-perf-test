@@ -27,9 +27,8 @@ def _default_output() -> str:
     return os.path.join("results", f"bench_{_timestamp()}.jsonl")
 
 
-def _discover_and_print_gpus() -> None:
-    """Discover Vulkan GPUs via vulkaninfo and print them; does not set env vars."""
-    from llama_bench.gpu import discover_vulkan_gpus
+def _discover_and_print_gpus() -> str:
+    from llama_bench.gpu import default_vk_devices, discover_vulkan_gpus
     gpus = discover_vulkan_gpus()
     if gpus:
         console.print(f"[green]Vulkan GPUs discovered:[/] {len(gpus)}")
@@ -37,6 +36,7 @@ def _discover_and_print_gpus() -> None:
             console.print(f"  [{g['index']}] {g['name']}")
     else:
         console.print("[yellow]No Vulkan GPUs discovered (vulkaninfo not available).[/]")
+    return default_vk_devices(gpus)
 
 
 def _resolve_server_path(server: str) -> str:
@@ -106,16 +106,7 @@ def _print_validation(cfg) -> None:
 @click.group()
 @click.version_option("0.1.0", prog_name="llama-bench")
 def main() -> None:
-    """llama-bench: adaptive configuration tuner for llama.cpp llama-server.
-
-    Use the 'bench' command to run the reverse-engineering workload tuning loop.
-    It iterates context-size and GPU-layer combinations, applies adaptive error
-    handling on VRAM OOM, and emits a ranked JSONL + summary.json of usable configs.
-
-    Example:
-
-        llama-bench bench --model /path/to/model.gguf
-    """
+    """llama-bench: benchmarking and optimizer CLI for llama.cpp llama-server."""
 
 
 # ---------------------------------------------------------------------------
@@ -147,15 +138,10 @@ def main() -> None:
               help="Enable continuous batching.")
 @click.option("--threads", default=8, show_default=True, help="CPU inference threads.")
 @click.option("--threads-batch", default=8, show_default=True, help="CPU batch threads.")
-@click.option("--split-mode", default=None,
-              type=click.Choice(["none", "layer", "row"]), help="GPU split mode (default: auto — 'layer' for multiple Vulkan devices, 'none' otherwise).")
-@click.option("--engine", default="vulkan", show_default=True,
-              type=click.Choice(["vulkan", "cpu"]),
-              help="Inference engine backend. 'vulkan' enables GPU offload via Vulkan.")
+@click.option("--split-mode", default="none", show_default=True,
+              type=click.Choice(["none", "layer", "row"]), help="GPU split mode.")
 @click.option("--vk-devices", default=None,
-              help="Comma-separated Vulkan device indices to expose via "
-                   "GGML_VK_VISIBLE_DEVICES.  If omitted, all devices are used "
-                   "(env var not set).")
+              help="GGML_VK_VISIBLE_DEVICES value (auto-discover if omitted).")
 @click.option("--sudo/--no-sudo", default=True, show_default=True,
               help="Launch server with sudo.")
 # --- Tuner bounds ---
@@ -172,10 +158,9 @@ def main() -> None:
 @click.option("--max-retries", default=5, show_default=True,
               help="Max retry attempts per candidate config on OOM.")
 # --- Performance thresholds ---
-@click.option("--max-ttft-s", "max_ttft_s", default=None, type=float,
-              help="Maximum acceptable TTFT in seconds. Disabled by default; "
-                   "TTFT is recorded but does not gate usability.")
-@click.option("--min-tokens-per-sec", default=4.0, show_default=True,
+@click.option("--max-ttft", default=60.0, show_default=True,
+              help="Maximum acceptable TTFT in seconds.")
+@click.option("--min-tokens-per-sec", default=1.0, show_default=True,
               help="Minimum acceptable decode throughput (tokens/s).")
 @click.option("--ctx-pct-threshold", default=0.90, show_default=True,
               help="Fraction of max usable ctx for secondary throughput ranking.")
@@ -184,21 +169,25 @@ def main() -> None:
               help="JSONL output path (default: results/bench_<timestamp>.jsonl).")
 @click.option("--summary", default=None,
               help="Summary JSON path (default: results/summary.json).")
+@click.option("--n-followups", default=4, show_default=True,
+              help="Number of follow-up prompts per configuration run.")
+@click.option("--max-tokens", "max_tokens", default=512, show_default=True,
+              help="Max tokens the model generates per request (affects speed).")
+
 @click.option("--prompt-pack", default=None, type=click.Path(exists=True),
               help="Path to a custom prompt pack (JSON/YAML).")
 @click.option("--no-tui", is_flag=True, default=False, help="Disable TUI, use plain output.")
-@click.option("--max-tokens", default=512, show_default=True,
-              help="Maximum tokens to generate per request.")
 @click.option("-v", "--verbose", "verbosity", count=True,
               help="Verbose output; use -vv for debug-level logging.")
 def bench(
     server, model, host, port, np, ctx, n_gpu_layers, flash_attn,
     batch_size, ubatch_size, cache_type_k, cache_type_v, kv_unified,
     cache_reuse, cont_batching, threads, threads_batch, split_mode,
-    engine, vk_devices, sudo,
+    vk_devices, sudo,
     ctx_min, ctx_max, ctx_step, ngl_step, batch_step, max_retries,
-    max_ttft_s, min_tokens_per_sec, ctx_pct_threshold,
-    output, summary, prompt_pack, no_tui, verbosity, max_tokens,
+    max_ttft, min_tokens_per_sec, ctx_pct_threshold,
+    output, summary, prompt_pack, no_tui, verbosity,
+    n_followups, max_tokens,
 ) -> None:
     """Adaptive configuration tuner: find the highest usable context for your model.
 
@@ -207,7 +196,6 @@ def bench(
     """
     import json as _json
     from llama_bench.config import configs_from_args
-    from llama_bench.gpu import list_devices_from_server
     from llama_bench.logging_setup import setup_logging
     from llama_bench.prompts import build_prompt_sequence, load_prompt_pack
     from llama_bench.tuner import (
@@ -223,42 +211,16 @@ def bench(
 
     server = _resolve_server_path(server)
 
-    # Device resolution via --list-devices
-    resolved_device: Optional[str] = None
-    if engine == "cpu":
-        resolved_device = "none"
-        console.print("[dim]Engine: cpu — passing --device none to llama-server[/]")
-    elif engine == "vulkan":
-        _discover_and_print_gpus()
-        available_devices = list_devices_from_server(server)
-        if available_devices:
-            console.print("[green]Available devices (from --list-devices):[/]")
-            for idx, name in sorted(available_devices.items()):
-                console.print(f"  [{idx}] {name}")
-        if vk_devices is not None:
-            # Validate and resolve requested device indices
-            requested_indices = [int(x.strip()) for x in vk_devices.split(",")]
-            missing = [i for i in requested_indices if i not in available_devices]
-            if missing:
-                console.print(
-                    f"[bold red]Error:[/] Requested Vulkan device index(es) {missing} "
-                    f"not found. Available: {dict(sorted(available_devices.items()))}"
-                )
-                sys.exit(1)
-            resolved_names = ",".join(available_devices[i] for i in requested_indices)
-            resolved_device = resolved_names
-            console.print(f"[dim]Using VK devices: {vk_devices} → {resolved_device}[/]")
-        else:
-            # No --vk-devices: do not set GGML_VK_VISIBLE_DEVICES, do not pass --device
-            console.print("[dim]No --vk-devices specified; letting server choose Vulkan device(s)[/]")
+    if vk_devices is None:
+        vk_devices = _discover_and_print_gpus()
+    else:
+        console.print(f"Using VK devices: {vk_devices}")
 
-    # Auto-detect split mode: 'layer' is required for multi-GPU, 'none' for single/CPU
-    if split_mode is None:
-        if resolved_device and "," in resolved_device:
-            split_mode = "layer"
-            console.print("[dim]Auto-set --split-mode layer (multiple Vulkan devices)[/]")
-        else:
-            split_mode = "none"
+    # Auto-enable layer-split when multiple Vulkan devices are in use and the
+    # user has not explicitly requested a different mode.
+    if split_mode == "none" and vk_devices and "," in str(vk_devices):
+        split_mode = "layer"
+        console.print("[dim]Auto-set split-mode=layer for multi-GPU[/]")
 
     _check_version(server, sudo)
 
@@ -271,7 +233,8 @@ def bench(
         ubatch_size=ubatch_size, cache_type_k=cache_type_k, cache_type_v=cache_type_v,
         kv_unified=kv_unified, cache_reuse=cache_reuse, cont_batching=cont_batching,
         threads=threads, threads_batch=threads_batch, split_mode=split_mode,
-        vk_devices=vk_devices, use_sudo=sudo, engine=engine, device=resolved_device,
+        vk_devices=vk_devices, use_sudo=sudo,
+        max_predict_tokens=max_tokens,
     )
     _print_validation(base_cfg)
 
@@ -284,7 +247,7 @@ def bench(
         max_retries=max_retries,
     )
     thresholds = TunerThresholds(
-        max_ttft_s=max_ttft_s,
+        max_ttft_s=max_ttft,
         min_tokens_per_sec=min_tokens_per_sec,
     )
 
@@ -292,81 +255,59 @@ def bench(
 
     console.print(
         f"[bold]Tuner sweep[/] ctx {effective_ctx_max}→{ctx_min} step {ctx_step} "
-        f"| engine={engine} | max_retries={max_retries} | output → {output_path}"
+        f"| max_retries={max_retries} | output → {output_path}"
     )
 
     def _plain_progress(current: int, total: int) -> None:
         console.print(f"[dim]  [{current}/{total}][/]")
 
+    # Build the prompt sequence (use custom pack if provided, else built-in workload)
+    if prompt_pack:
+        from llama_bench.prompts import load_prompt_pack
+        prompt_seq_override = load_prompt_pack(prompt_pack)
+    else:
+        prompt_seq_override = None
+
     if no_tui:
         tuner = AdaptiveTuner(
             base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
             artifacts_dir=artifacts_dir, log_file=log_file,
-            progress_cb=_plain_progress, max_tokens=max_tokens,
+            progress_cb=_plain_progress,
+            n_followups=n_followups, max_tokens=max_tokens,
+            prompt_seq_override=prompt_seq_override,
         )
         attempts = tuner.run()
     else:
+        from llama_bench.hw_monitor import HWMonitor
         from llama_bench.tui import BenchTUI
-        total_candidates = max(
-            1, (effective_ctx_max - ctx_min) // ctx_step + 1
+        hw_monitor = HWMonitor()
+        hw_monitor.start()
+        tui = BenchTUI(hw_monitor=hw_monitor, bench_log_path=log_file)
+
+        def _tui_progress(current: int, total: int) -> None:
+            tui.update_progress(current, total, 1, "tuner sweep")
+
+        tuner = AdaptiveTuner(
+            base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
+            artifacts_dir=artifacts_dir, log_file=log_file,
+            progress_cb=_tui_progress,
+            n_followups=n_followups, max_tokens=max_tokens,
+            prompt_seq_override=prompt_seq_override,
+            event_cb=tui.handle_event,
+            stop_event=tui._stop_event,
         )
-        # Build initial to-do list
-        todos = [
-            f"ctx={effective_ctx_max - i * ctx_step} ngl={n_gpu_layers} batch={batch_size}"
-            for i in range(total_candidates)
-        ]
-        with BenchTUI() as tui:
-            tui.set_todos(todos)
-
-            def _tui_progress(current: int, total: int) -> None:
-                tui.update_progress(current, total, 1, "tuner sweep")
-                # Update remaining to-dos
-                remaining = todos[current:]
-                tui.set_todos(remaining)
-
-            tuner = AdaptiveTuner(
-                base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
-                artifacts_dir=artifacts_dir, log_file=log_file,
-                progress_cb=_tui_progress, max_tokens=max_tokens,
-            )
-            attempts = tuner.run()
-
-            # Show engine mismatch warning (red) if any attempt detected it
-            engine_mismatch_shown = False
+        attempts = tui.run(tuner.run)
+        hw_monitor.stop()
+    # Write JSONL (attempts may be [] if user quit early)
+    if attempts:
+        from llama_bench.tuner import _attempt_to_dict as _atd
+        with open(output_path, "w", encoding="utf-8") as fh:
             for a in attempts:
-                if a.engine_mismatch and not engine_mismatch_shown:
-                    tui.add_error(
-                        f"Engine mismatch: --engine {engine} requested but Vulkan backend "
-                        "was not active in server. Check your llama-server build.",
-                        red=True,
-                    )
-                    engine_mismatch_shown = True
-
-            for a in attempts:
-                tui.set_current_state(
-                    f"ctx={a.ctx} ngl={a.n_gpu_layers} batch={a.batch_size}"
-                )
-                score = a.tokens_per_sec if a.success else 0.0
-                tui.add_result(
-                    a.run_id,
-                    f"ctx={a.ctx} ngl={a.n_gpu_layers} batch={a.batch_size}",
-                    score, a.success, a.failure_reason,
-                )
-
-    # Engine mismatch warning for no-tui mode
-    if any(a.engine_mismatch for a in attempts):
-        console.print(
-            f"[bold red]Engine mismatch:[/red] --engine {engine} requested but Vulkan "
-            "backend was not active in server. Check your llama-server build."
-        )
-
-    # Write JSONL
-    from llama_bench.tuner import _attempt_to_dict as _atd
-    with open(output_path, "w", encoding="utf-8") as fh:
-        for a in attempts:
-            fh.write(_json.dumps(_atd(a)) + "\n")
-
-    console.print(f"[green]Results saved to[/] {output_path}")
+                fh.write(_json.dumps(_atd(a)) + "\n")
+        console.print(f"[green]Results saved to[/] {output_path}")
+    else:
+        console.print("[yellow]Bench stopped early — no results saved.[/]")
+        return
 
     # Multi-objective selection
     selection = select_best_configs(attempts, ctx_pct_threshold=ctx_pct_threshold)
@@ -438,7 +379,7 @@ def _print_tuner_summary(selection: dict) -> None:
 # search command
 # ---------------------------------------------------------------------------
 
-@main.command(hidden=True, deprecated=True)
+@main.command()
 @click.option("--server", "-s", default="./llama-server", show_default=True,
               help="Path to llama-server binary.")
 @click.option("--model", "-m", required=True, help="Path to model file (.gguf).")
@@ -481,7 +422,7 @@ def search(
     vk_devices, sudo,
     np_tests, ctx_tests, ngl_tests, max_configs, output, no_tui, verbosity,
 ) -> None:
-    """Deprecated: use 'bench' instead. Run a staged parameter search over the search space."""
+    """Run a staged parameter search over the search space."""
     from llama_bench.config import (
         SearchSpace,
         configs_from_args,
@@ -500,7 +441,7 @@ def search(
     server = _resolve_server_path(server)
 
     if vk_devices is None:
-        _discover_and_print_gpus()
+        vk_devices = _discover_and_print_gpus()
 
     _check_version(server, sudo)
 
@@ -539,25 +480,31 @@ def search(
         results = searcher.run()
     else:
         from llama_bench.tui import BenchTUI
-        with BenchTUI() as tui:
-            def _tui_cb(current: int, total: int, phase: int, phase_name: str) -> None:
-                tui.update_progress(current, total, phase, phase_name)
+        tui = BenchTUI(bench_log_path=log_file)
 
-            searcher = StagedSearcher(
-                space=space,
-                base_cfg=base_cfg,
-                artifacts_dir=os.path.dirname(os.path.abspath(output_path)),
-                max_configs=max_configs,
-                progress_cb=_tui_cb,
-                log_file=log_file,
-            )
-            results = searcher.run()
+        def _tui_cb(current: int, total: int, phase: int, phase_name: str) -> None:
+            tui.update_progress(current, total, phase, phase_name)
 
+        searcher = StagedSearcher(
+            space=space,
+            base_cfg=base_cfg,
+            artifacts_dir=os.path.dirname(os.path.abspath(output_path)),
+            max_configs=max_configs,
+            progress_cb=_tui_cb,
+            log_file=log_file,
+        )
+
+        def _search_work():
+            r = searcher.run()
             best = searcher.best_config()
             if best:
+                scores = [x.best_score for x in r if x.best_score < float("inf")]
                 tui.set_best(f"np={best.np}, ctx={best.ctx}, ngl={best.n_gpu_layers}", 
-                             min(r.best_score for r in results if r.best_score < float("inf")))
+                    min(scores) if scores else float("inf"),
+                )
+            return r
 
+        results = tui.run(_search_work)
     save_results(results, output_path)
     console.print(f"[green]Search complete. Results saved to[/] {output_path}")
 
@@ -594,3 +541,186 @@ def report(input_files: tuple[str, ...], output: "Optional[str]", top_n: int) ->
     content = generate_markdown_report(all_results, output)
     console.print(f"[green]Report written to[/] {output}")
     print_summary_table(all_results[:top_n])
+
+
+# ---------------------------------------------------------------------------
+# explore command
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.option("--server", "-s", default="./llama-server", show_default=True)
+@click.option("--model", "-m", required=True)
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--port", "-p", default=5001, show_default=True)
+@click.option("--np", default=1, show_default=True)
+@click.option("--ctx", "-c", default=131072, show_default=True,
+              help="Maximum context size for the sweep.")
+@click.option("--ctx-min", default=8192, show_default=True)
+@click.option("--ctx-step", default=8192, show_default=True)
+@click.option("--n-gpu-layers", "-ngl", "n_gpu_layers", default=45, show_default=True)
+@click.option("--ngl-tests", default=None,
+              help="Comma-separated ngl values to sweep, e.g. '37,41,45'. Default: just --n-gpu-layers.")
+@click.option("--flash-attn/--no-flash-attn", default=True, show_default=True)
+@click.option("--batch-size", default=1536, show_default=True)
+@click.option("--batch-tests", default=None,
+              help="Comma-separated batch values to sweep, e.g. '1024,1536'. Default: just --batch-size.")
+@click.option("--ubatch-size", default=512, show_default=True)
+@click.option("--cache-type-k", default="q8_0", show_default=True)
+@click.option("--cache-type-v", default="q8_0", show_default=True)
+@click.option("--kv-unified/--no-kv-unified", default=True, show_default=True)
+@click.option("--cache-reuse", default=512, show_default=True)
+@click.option("--cont-batching/--no-cont-batching", default=True, show_default=True)
+@click.option("--threads", default=8, show_default=True)
+@click.option("--threads-batch", default=8, show_default=True)
+@click.option("--split-mode", default="none", show_default=True,
+              type=click.Choice(["none", "layer", "row"]))
+@click.option("--vk-devices", default=None)
+@click.option("--sudo/--no-sudo", default=True, show_default=True)
+@click.option("--ngl-step", default=4, show_default=True)
+@click.option("--batch-step", default=256, show_default=True)
+@click.option("--ngl-min", default=0, show_default=True)
+@click.option("--max-retries", default=5, show_default=True)
+@click.option("--max-ttft", default=60.0, show_default=True)
+@click.option("--min-tokens-per-sec", default=1.0, show_default=True)
+@click.option("--n-followups", default=2, show_default=True,
+              help="Follow-up prompts per run (default 2 for faster exploration).")
+@click.option("--max-tokens", "max_tokens", default=512, show_default=True)
+@click.option("--output", "-o", default=None)
+@click.option("--no-tui", is_flag=True, default=False)
+@click.option("-v", "--verbose", "verbosity", count=True)
+def explore(
+    server, model, host, port, np, ctx, ctx_min, ctx_step,
+    n_gpu_layers, ngl_tests, flash_attn, batch_size, batch_tests, ubatch_size,
+    cache_type_k, cache_type_v, kv_unified, cache_reuse, cont_batching,
+    threads, threads_batch, split_mode, vk_devices, sudo,
+    ngl_step, batch_step, ngl_min, max_retries,
+    max_ttft, min_tokens_per_sec, n_followups, max_tokens, output, no_tui, verbosity,
+) -> None:
+    """Continuous multi-objective explorer: runs until you press q/Ctrl+C.
+
+    Sweeps the (ctx, ngl, batch) space indefinitely and tracks the best config
+    for each of five objectives: Max Context, Fastest TTFT, Best Warm TTFT,
+    Best Throughput, Best Overall.
+    """
+    from llama_bench.config import configs_from_args, parse_range
+    from llama_bench.explorer import ContinuousExplorer
+    from llama_bench.logging_setup import setup_logging
+    from llama_bench.tuner import TunerBounds, TunerThresholds
+
+    ts = _timestamp()
+    output_path = output or os.path.join("results", f"explore_{ts}.jsonl")
+    artifacts_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(artifacts_dir, exist_ok=True)
+    log_file = setup_logging(verbosity, artifacts_dir)
+    if log_file:
+        console.print(f"[dim]Verbose log: {log_file}[/]")
+
+    server = _resolve_server_path(server)
+
+    if vk_devices is None:
+        vk_devices = _discover_and_print_gpus()
+    else:
+        console.print(f"Using VK devices: {vk_devices}")
+
+    if split_mode == "none" and vk_devices and "," in str(vk_devices):
+        split_mode = "layer"
+        console.print("[dim]Auto-set split-mode=layer for multi-GPU[/]")
+
+    _check_version(server, sudo)
+
+    base_cfg = configs_from_args(
+        server=server, model=model, host=host, port=port, np=np, ctx=ctx,
+        n_gpu_layers=n_gpu_layers, flash_attn=flash_attn, batch_size=batch_size,
+        ubatch_size=ubatch_size, cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+        kv_unified=kv_unified, cache_reuse=cache_reuse, cont_batching=cont_batching,
+        threads=threads, threads_batch=threads_batch, split_mode=split_mode,
+        vk_devices=vk_devices, use_sudo=sudo, max_predict_tokens=max_tokens,
+    )
+    _print_validation(base_cfg)
+
+    try:
+        ngl_values = parse_range(ngl_tests) if ngl_tests else [n_gpu_layers]
+        batch_values = parse_range(batch_tests) if batch_tests else [batch_size]
+    except ValueError as exc:
+        console.print(f"[red]Invalid range spec:[/] {exc}")
+        sys.exit(1)
+
+    bounds = TunerBounds(
+        ctx_min=ctx_min, ctx_max=ctx, ctx_step=ctx_step,
+        ngl_min=ngl_min, ngl_step=ngl_step,
+        batch_min=256, batch_step=batch_step,
+        max_retries=max_retries,
+    )
+    thresholds = TunerThresholds(max_ttft_s=max_ttft, min_tokens_per_sec=min_tokens_per_sec)
+
+    ctx_steps = list(range(ctx, ctx_min - 1, -ctx_step))
+    total_per_round = len(ngl_values) * len(batch_values) * len(ctx_steps)
+    console.print(
+        f"[bold]Continuous explore[/] ctx {ctx}→{ctx_min} step {ctx_step} | "
+        f"ngl {ngl_values} | batch {batch_values} | "
+        f"{total_per_round} configs/round | Press [bold]q[/] to stop"
+    )
+
+    if no_tui:
+        explorer = ContinuousExplorer(
+            base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
+            ngl_values=ngl_values, batch_values=batch_values,
+            artifacts_dir=artifacts_dir, log_file=log_file,
+            n_followups=n_followups, max_tokens=max_tokens,
+            output_path=output_path,
+        )
+        attempts = explorer.run()
+        hof = explorer.hall_of_fame
+    else:
+        from llama_bench.hw_monitor import HWMonitor
+        from llama_bench.tui import BenchTUI
+        hw_monitor = HWMonitor()
+        hw_monitor.start()
+        tui = BenchTUI(hw_monitor=hw_monitor, bench_log_path=log_file)
+
+        explorer = ContinuousExplorer(
+            base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
+            ngl_values=ngl_values, batch_values=batch_values,
+            artifacts_dir=artifacts_dir, log_file=log_file,
+            n_followups=n_followups, max_tokens=max_tokens,
+            event_cb=tui.handle_event,
+            stop_event=tui._stop_event,
+            output_path=output_path,
+        )
+        attempts = tui.run(explorer.run)
+        hw_monitor.stop()
+        hof = explorer.hall_of_fame
+
+    console.print(
+        f"\n[bold]Explorer stopped[/] after {hof.total_tested} configs "
+        f"across {hof.round_num} round(s)."
+    )
+    _print_hof_summary(hof)
+    if attempts:
+        console.print(f"[green]Results saved to[/] {output_path}")
+    else:
+        console.print("[yellow]No results saved (stopped before any completed).[/]")
+
+
+def _print_hof_summary(hof) -> None:
+    """Print the Hall of Fame as a Rich table."""
+    from rich.table import Table
+    entries = hof.entries()
+    if not entries:
+        console.print("[yellow]No successful configs found.[/]")
+        return
+    table = Table(title="Hall of Fame — Best Configs by Objective", show_lines=False)
+    table.add_column("Objective", style="bold")
+    table.add_column("ctx", justify="right")
+    table.add_column("ngl", justify="right")
+    table.add_column("batch", justify="right")
+    table.add_column("Cold TTFT", justify="right")
+    table.add_column("Warm TTFT", justify="right")
+    table.add_column("tok/s", justify="right")
+    for e in entries:
+        table.add_row(
+            e.label, str(e.ctx), str(e.ngl), str(e.batch),
+            f"{e.cold_ttft_s:.2f}s", f"{e.warm_ttft_s:.3f}s",
+            f"{e.tokens_per_sec:.1f}",
+        )
+    console.print(table)

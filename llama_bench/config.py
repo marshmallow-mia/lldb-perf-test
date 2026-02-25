@@ -253,6 +253,9 @@ class BenchConfig:
     threads_batch: int = 8
 
 
+    # Generation limits
+    max_predict_tokens: int = 512
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -354,6 +357,7 @@ def configs_from_args(
     threads: int = 8,
     threads_batch: int = 8,
     split_mode: str = "none",
+    max_predict_tokens: int = 512,
     vk_devices: Optional[str] = None,
     use_sudo: bool = True,
     engine: str = "vulkan",
@@ -368,8 +372,8 @@ def configs_from_args(
         port=port,
         use_sudo=use_sudo,
         vk_visible_devices=vk_devices,
-        device=device,
         engine=engine,
+        device=device,
         np=np,
         ctx=ctx,
         n_gpu_layers=n_gpu_layers,
@@ -384,4 +388,5 @@ def configs_from_args(
         threads=threads,
         threads_batch=threads_batch,
         split_mode=split_mode,
+        max_predict_tokens=max_predict_tokens,
     )

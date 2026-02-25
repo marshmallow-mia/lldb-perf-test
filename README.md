@@ -1,11 +1,10 @@
 # llama-bench
 
-**llama-bench** is a command-line adaptive tuning and testing tool for
-[llama.cpp](https://github.com/ggerganov/llama.cpp)'s `llama-server`.  It runs a
-realistic **reverse-engineering workload**, automatically iterates server
-configurations, handles VRAM OOM errors gracefully, and emits ranked results so
-you can find the best combination of context size, GPU layers, and batch parameters
-for your hardware.
+**llama-bench** is a command-line benchmarking and parameter-search tool for
+[llama.cpp](https://github.com/ggerganov/llama.cpp)'s `llama-server`.  It measures
+end-to-end latency, time-to-first-token (TTFT), and decode throughput for realistic
+workloads, then helps you find the best combination of server flags for your hardware
+and use-case.
 
 ---
 
@@ -16,61 +15,36 @@ for your hardware.
 3. [Prerequisites](#prerequisites)
 4. [Quick Start](#quick-start)
 5. [Full CLI Reference](#full-cli-reference)
-6. [Profile Files](#profile-files)
-7. [How It Works](#how-it-works)
-8. [Output Format](#output-format)
-9. [Security Note](#security-note)
-10. [Version Compatibility](#version-compatibility)
-
+6. [TUI Dashboard](#tui-dashboard)
+7. [Profile Files](#profile-files)
+8. [How It Works](#how-it-works)
+9. [Output Format](#output-format)
+10. [Security Note](#security-note)
+11. [Version Compatibility](#version-compatibility)
+12. [Troubleshooting: Server Startup Failures](#troubleshooting-server-startup-failures)
 ---
 
 ## Overview
 
 `llama-bench` was built to answer the question: *what combination of
-`llama-server` flags gives the best latency and context capacity for my model,
-GPU, and workload?*
-
-It has a **single unified tuning mode** (`bench`) that:
-
-1. Iterates candidate context sizes from `--ctx` down to `--ctx-min` in steps of
-   `--ctx-step`, adjusting GPU layers and batch size when VRAM OOM is detected.
-2. Runs each valid configuration against the built-in **reverse-engineering
-   workload** — a ~1200-token expert system prompt plus a shared binary-analysis
-   context (drawn from the repository prompt files: `README.md`, `agent.md`,
-   `artifacts.md`), followed by follow-up questions that re-send the shared
-   prefix to exercise KV-cache prefix reuse.
-3. Collects TTFT, end-to-end latency, and tok/s for every run, then produces a
-   ranked JSONL result file and a `summary.json` with the best configurations.
+`llama-server` flags gives the lowest latency for my model, GPU, and workload?*
 
 Key features:
 
-- **Single tuning mode**: No separate bench/search modes. One unified `bench`
-  command for the reverse-engineering use case.
-- **Adaptive error handling**: VRAM OOM automatically reduces `--n-gpu-layers` and
-  `--batch-size` within configurable bounds before retrying.  Memory-fit
-  heuristics trigger either a proportional or big-step (halve) context reduction
-  depending on how far memory is from fitting.
-- **Reverse-engineering workload**: prompt corpus loaded from `README.md`,
-  `agent.md`, and `artifacts.md` (never `solution.md`), exercising
-  KV-cache prefix reuse across multi-turn conversations.
-- **Usability threshold**: A configuration is *usable* when
-  `tokens/s >= --min-tokens-per-sec` (default **4.0**).  TTFT is always recorded
-  and used for ranking, but TTFT gating is **disabled by default** (enable with
-  `--max-ttft-s`).
-- **Engine selection** (`--engine`): choose `vulkan` (default, GPU via Vulkan) or
-  `cpu`.  Pass `--vk-devices` to restrict which Vulkan device indices are visible
-  to the server.  If `--vk-devices` is omitted, `GGML_VK_VISIBLE_DEVICES` is not
-  set (all devices visible).
-- **Engine mismatch detection**: if `--engine vulkan` was requested but the server
-  binary does not emit any Vulkan backend lines, a **red warning** is displayed in
-  the TUI and printed to stdout.
-- **Rich TUI**: live display with four panels — *To-Dos* (remaining configs),
-  *Current State* (config under test), *Progress* bar with ETA, and *Errors /
-  Warnings* (critical errors in red, warnings in yellow).  Disable with
-  `--no-tui` for CI or logging use.
-- **Verbose logging** (`-v` / `-vv`): INFO or DEBUG output to stderr *and* a
-  timestamped log file under the results directory.
-- **Report generation** (`report`): JSONL to Markdown with ranked tables.
+- **Single-config benchmark** (`bench`): adaptive sweep from max context down to
+  minimum, with OOM retry logic, collecting cold/warm TTFT and throughput.
+- **Staged parameter search** (`search`): coarse sweep over a large config space,
+  then refine the top 25% — all with early-stopping to skip obviously bad configs.
+- **Continuous explorer** (`explore`): runs indefinitely, sweeping the full
+  `(ctx, ngl, batch)` grid and maintaining a live **Hall of Fame** across five
+  objectives: Max Context, Fastest TTFT, Best Warm TTFT, Best Throughput, Best Overall.
+- **Rich TUI**: 8-panel live dashboard with hardware monitors, activity log, settings
+  display, results table, Hall of Fame, progress bar, server log tail, and verbose log.
+- **Report generation** (`report`): JSONL → Markdown with ranked tables.
+- **Reverse-engineering workload**: built-in 1000-token system prompt + shared
+  code-analysis prefix, exercising KV-cache prefix reuse heavily.
+- **Vulkan GPU discovery**: auto-detects GPUs via `vulkaninfo` and sets
+  `GGML_VK_VISIBLE_DEVICES`.
 
 ---
 
@@ -92,41 +66,23 @@ The CLI entry point `llama-bench` is installed automatically.
 
 | Requirement | Notes |
 |-------------|-------|
-| Python >= 3.10 | |
+| Python ≥ 3.10 | |
 | `llama-server` binary | Build from [llama.cpp](https://github.com/ggerganov/llama.cpp) |
 | A `.gguf` model file | Any GGUF-format model |
-| Vulkan drivers + `vulkaninfo` | Optional; enables GPU discovery display |
+| Vulkan drivers + `vulkaninfo` | Optional; enables GPU discovery |
 | `sudo` access | Required when `--sudo` is set (default) |
 
 ---
 
 ## Quick Start
 
-### Run the adaptive tuner (Vulkan GPU, all devices)
+### Run a single benchmark
 
 ```bash
 llama-bench bench --model /path/to/model.gguf
 ```
 
-### Run with a specific Vulkan device
-
-```bash
-llama-bench bench \
-  --model /path/to/model.gguf \
-  --engine vulkan \
-  --vk-devices 0
-```
-
-### Run on CPU only
-
-```bash
-llama-bench bench \
-  --model /path/to/model.gguf \
-  --engine cpu \
-  --n-gpu-layers 0
-```
-
-### Override the binary path and a few flags
+Override the binary path and a few flags:
 
 ```bash
 llama-bench bench \
@@ -138,24 +94,35 @@ llama-bench bench \
   --output results/codellama_bench.jsonl
 ```
 
-### Control the tuning sweep bounds
+### Run a parameter search
 
 ```bash
-llama-bench bench \
+llama-bench search \
   --model /data/models/codellama-34b.Q5_K_M.gguf \
-  --ctx 98304 \
-  --ctx-min 16384 \
-  --ctx-step 16384 \
-  --ngl-step 4 \
-  --max-retries 3
+  --np-tests 1-2 \
+  --ctx-tests 49152,98304 \
+  --ngl-tests 40,45,47 \
+  --max-configs 30
 ```
 
-### Add TTFT gating (optional)
+### Run the continuous multi-objective explorer
+
+Sweeps `(ctx, ngl, batch)` indefinitely and tracks the best config for five objectives.
+Press `q` or `Ctrl+C` to stop at any time.
 
 ```bash
-llama-bench bench \
-  --model /data/models/codellama-34b.Q5_K_M.gguf \
-  --max-ttft-s 30.0
+# Vary only context (single ngl/batch)
+llama-bench explore \
+  --model /data/models/my-model.gguf \
+  --ctx 131072 --ctx-min 8192 --ctx-step 8192
+
+# Full grid sweep across multiple ngl and batch values (multi-GPU)
+llama-bench explore \
+  --model /data/models/my-model.gguf \
+  --ctx 131072 --ctx-min 32768 \
+  --ngl-tests 37,41,45 \
+  --batch-tests 1024,1536 \
+  --vk-devices 0,1
 ```
 
 ### Run with verbose logging (no TUI)
@@ -165,11 +132,33 @@ to stderr **and** to a timestamped log file under `results/`:
 
 ```bash
 # INFO-level verbose, plain output (no TUI)
-llama-bench bench \
+llama-bench search \
   -v --no-tui \
   --model /data/models/codellama-34b.Q5_K_M.gguf \
   --server /opt/llama.cpp/llama-server
+
+# DEBUG-level verbose, plain output
+llama-bench search \
+  -vv --no-tui \
+  --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --server /opt/llama.cpp/llama-server
+
+# DEBUG-level verbose with TUI (logs go to file only; TUI is shown in terminal)
+llama-bench search \
+  -vv \
+  --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --server /opt/llama.cpp/llama-server
 ```
+
+Verbose logs include:
+- Resolved server binary path
+- Version check result
+- Server start command, PID, and log file paths
+- Health-check polling progress
+- Each benchmark request with TTFT, end-to-end latency, and tok/s
+- Server log parsing summary
+
+The log file path is also recorded in each JSONL result entry as `log_file`.
 
 ### Generate a report
 
@@ -183,8 +172,7 @@ llama-bench report results/bench_*.jsonl --output results/report.md
 
 ### `llama-bench bench`
 
-Adaptive configuration tuner: sweep context sizes and GPU-layer values,
-apply error handling on OOM, and emit ranked results.
+Run a benchmark with a single configuration.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -193,7 +181,7 @@ apply error handling on OOM, and emit ranked results.
 | `--host` | `0.0.0.0` | Server bind address |
 | `--port`, `-p` | `5001` | Server port |
 | `--np` | `1` | Number of parallel request slots |
-| `--ctx`, `-c` | `49152` | Starting (maximum) context size (tokens) |
+| `--ctx`, `-c` | `49152` | Total KV-cache context tokens |
 | `--n-gpu-layers`, `-ngl` | `45` | Layers to offload to GPU |
 | `--flash-attn` / `--no-flash-attn` | `True` | Flash Attention |
 | `--batch-size` | `1536` | Logical batch size |
@@ -206,22 +194,87 @@ apply error handling on OOM, and emit ranked results.
 | `--threads` | `8` | CPU inference threads |
 | `--threads-batch` | `8` | CPU batch-processing threads |
 | `--split-mode` | `none` | GPU split mode (`none`/`layer`/`row`) |
-| `--engine` | `vulkan` | Inference engine: `vulkan` or `cpu` |
-| `--vk-devices` | *(all devices)* | Comma-separated Vulkan device indices for `GGML_VK_VISIBLE_DEVICES`. If omitted, env var is not set. |
+| `--vk-devices` | auto | `GGML_VK_VISIBLE_DEVICES` value |
 | `--sudo` / `--no-sudo` | `True` | Launch server with sudo |
-| `--ctx-min` | `8192` | Minimum context size to try |
-| `--ctx-max` | -- | Maximum context size (defaults to `--ctx`) |
-| `--ctx-step` | `8192` | Context step between candidates |
-| `--ngl-step` | `4` | GPU-layers reduction step on OOM |
-| `--batch-step` | `256` | Batch-size reduction step on OOM |
-| `--max-retries` | `5` | Max retry attempts per candidate on OOM |
-| `--max-ttft-s` | *(disabled)* | Max acceptable TTFT (seconds). Disabled by default; TTFT recorded but does not gate usability. |
-| `--min-tokens-per-sec` | `4.0` | Minimum decode throughput (tokens/s) |
-| `--ctx-pct-threshold` | `0.90` | Fraction of max usable ctx for secondary throughput ranking |
-| `--output`, `-o` | auto | JSONL output path (default: `results/bench_<timestamp>.jsonl`) |
-| `--summary` | auto | Summary JSON path (default: `results/summary.json`) |
+| `--n-followups` | `4` | Follow-up prompts per run |
+| `--max-tokens` | `512` | Max tokens generated per request (controls decode length) |
+| `--output`, `-o` | auto | JSONL output path |
+| `--prompt-pack` | — | Custom prompt pack file (JSON/YAML) |
 | `--no-tui` | `False` | Disable TUI, use plain output |
 | `-v` / `--verbose` | off | Verbose logs to stderr + file (`-vv` for debug) |
+
+### `llama-bench search`
+
+All flags from `bench`, plus:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--np-tests` | `1` | Range spec for `-np`, e.g. `1-2` or `1,2` |
+| `--ctx-tests` | `49152` | Range spec for `-c` |
+| `--ngl-tests` | `45` | Range spec for `--n-gpu-layers` |
+| `--max-configs` | `50` | Maximum configs to evaluate |
+| `--no-tui` | `False` | Disable TUI |
+| `-v` / `--verbose` | off | Verbose logs to stderr + file (`-vv` for debug) |
+
+Range specs accept:
+- `"1-4"` → `[1, 2, 3, 4]`
+- `"1,2,4"` → `[1, 2, 4]`
+- `"49152"` → `[49152]`
+
+### `llama-bench explore`
+
+Runs **indefinitely** until you press `q` or `Ctrl+C`.  Each round sweeps the full
+Cartesian product of `ctx × ngl × batch` values and updates the Hall of Fame after
+every completed run.  Results are appended to the JSONL output immediately — nothing
+is lost if you stop mid-sweep.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--server`, `-s` | `./llama-server` | Path to llama-server binary |
+| `--model`, `-m` | *(required)* | Path to model `.gguf` file |
+| `--host` | `0.0.0.0` | Server bind address |
+| `--port`, `-p` | `5001` | Server port |
+| `--np` | `1` | Number of parallel request slots |
+| `--ctx`, `-c` | `131072` | Maximum context size for the sweep |
+| `--ctx-min` | `8192` | Minimum context size to try |
+| `--ctx-step` | `8192` | Context step between candidates |
+| `--n-gpu-layers`, `-ngl` | `45` | Starting GPU layers (used when `--ngl-tests` is omitted) |
+| `--ngl-tests` | — | Comma-separated ngl values to sweep, e.g. `37,41,45` |
+| `--flash-attn` / `--no-flash-attn` | `True` | Flash Attention |
+| `--batch-size` | `1536` | Starting batch size (used when `--batch-tests` is omitted) |
+| `--batch-tests` | — | Comma-separated batch values to sweep, e.g. `1024,1536` |
+| `--ubatch-size` | `512` | Micro batch size |
+| `--cache-type-k` | `q8_0` | K cache quantisation type |
+| `--cache-type-v` | `q8_0` | V cache quantisation type |
+| `--kv-unified` / `--no-kv-unified` | `True` | Unified KV cache pool |
+| `--cache-reuse` | `512` | Min prefix tokens for KV cache reuse |
+| `--cont-batching` / `--no-cont-batching` | `True` | Continuous batching |
+| `--threads` | `8` | CPU inference threads |
+| `--threads-batch` | `8` | CPU batch-processing threads |
+| `--split-mode` | `none` | GPU split mode (`none`/`layer`/`row`) |
+| `--vk-devices` | auto | `GGML_VK_VISIBLE_DEVICES` value |
+| `--sudo` / `--no-sudo` | `True` | Launch server with sudo |
+| `--ngl-step` | `4` | ngl reduction step on OOM retry |
+| `--batch-step` | `256` | Batch size reduction step on OOM retry |
+| `--ngl-min` | `0` | Minimum ngl value during OOM retry |
+| `--max-retries` | `5` | Max OOM retry attempts per candidate |
+| `--max-ttft` | `60.0` | Maximum acceptable TTFT (seconds) |
+| `--min-tokens-per-sec` | `1.0` | Minimum acceptable throughput |
+| `--n-followups` | `2` | Follow-up prompts per run (lower = faster sweeps) |
+| `--max-tokens` | `512` | Max tokens generated per request |
+| `--output`, `-o` | auto | JSONL output path (default: `results/explore_<ts>.jsonl`) |
+| `--no-tui` | `False` | Disable TUI, use plain output |
+| `-v` / `--verbose` | off | Verbose logs to stderr + file (`-vv` for debug) |
+
+**Hall of Fame objectives tracked:**
+
+| Objective | Optimises |
+|-----------|-----------|
+| Max Context | Highest `ctx` that completed successfully |
+| Fastest TTFT | Lowest cold time-to-first-token |
+| Best Warm TTFT | Lowest warm TTFT (KV cache hit on follow-up requests) |
+| Best Throughput | Highest decode tokens/s |
+| Best Overall | Balanced score: `√ctx × tok/s ÷ (1 + cold_ttft)` |
 
 ### `llama-bench report`
 
@@ -233,6 +286,27 @@ llama-bench report <file1.jsonl> [file2.jsonl ...] [--output report.md] [--top-n
 |------|---------|-------------|
 | `--output`, `-o` | derived from input | Markdown output path |
 | `--top-n` | `10` | Top results to include in table |
+
+---
+
+## TUI Dashboard
+
+All three commands (`bench`, `explore`, `search`) display the same full-screen
+Textual dashboard.  Press `q` or `Ctrl+C` at any time to stop.
+
+| Panel | Description |
+|-------|-------------|
+| **Current Run** | Active phase, config (ctx/ngl/batch), elapsed time, ETA |
+| **Hardware** | Per-GPU VRAM bar, utilisation %, temperature; CPU %; RAM |
+| **Settings** | Base configuration snapshot: model name, context sweep range, NGL/batch/µbatch, Flash/KV-Unified/ContBatch flags, KV cache types and reuse threshold, split mode, Vulkan devices, thread counts |
+| **Server Command** | Full `llama-server` invocation as actually executed (never truncated) |
+| **Activity** | Timestamped event log: server start, health-poll progress, prompt sends, results, retries |
+| **Progress** | Sweep progress bar with candidate count and ETA |
+| **Results** | Rolling table of completed runs: ctx, ngl, batch, cold/warm TTFT, tok/s sparkline trend, peak VRAM |
+| **Best Configs (Hall of Fame)** | Live best-per-objective table — updated after every `explore` run; shows a hint for `bench`/`search` |
+| **Retries** | OOM/failure retry history with reason and parameter adjustment |
+| **Server Log** | Live tail of `llama-server` stderr |
+| **Verbose Log** | Tail of the bench tool’s own log file (visible when `-v`/`-vv` is passed) |
 
 ---
 
@@ -253,92 +327,50 @@ benchmark:
 objective: minimize_e2e_latency
 ```
 
-*Profile loading via CLI is on the roadmap; currently use `--ctx`, `--ctx-min`, etc.*
+*Profile loading via CLI is on the roadmap; currently use `--np-tests`, `--ctx-tests`, etc.*
 
 ---
 
 ## How It Works
 
-### Reverse-Engineering Workload
+### Adaptive Tuner (`bench`)
 
-The benchmark uses a realistic reverse-engineering workload to stress-test
-the server under representative conditions:
+1. Generates candidates from `ctx_max` down to `ctx_min` in steps of `ctx_step`.
+2. Starts `llama-server` for each candidate and runs the prompt workload.
+3. On OOM: reduces `ngl` by `--ngl-step` (or uses a heuristic from the server’s
+   memory-fit log line), then reduces `--batch-size` when ngl reaches its minimum.
+4. Records cold TTFT, warm TTFT, and tok/s for each attempt.
+5. Emits a multi-objective summary: max usable context, top-throughput configs near
+   max context, and a recommended stable config.
 
-- **System prompt** (~1200 tokens): Expert-level reverse engineer persona with
-  deep knowledge of assembly, binary analysis, heap exploitation, and debugger
-  tooling (IDA Pro, Ghidra, lldb, Frida).
-- **Corpus context**: Loaded from the repository prompt files — `README.md`,
-  `agent.md`, and `artifacts.md` — and injected as a shared prefix in every
-  prompt turn.  `solution.md` is intentionally excluded from the prompt
-  corpus to avoid leaking answers.
-- **Follow-up questions**: Each run includes an initial analysis request followed
-  by follow-up questions (vulnerability identification, exploit PoC, debugger
-  scripting, etc.) that re-send the same shared prefix, exercising KV-cache
-  prefix reuse.
+### Staged Search (`search`)
 
-### Adaptive Tuning Loop
+1. **Phase 1 — coarse sweep**: generate the Cartesian product of all search-space
+   values (capped at `--max-configs`), run each with 2 follow-up prompts.
+2. **Phase 2 — refinement**: take the top 25% of Phase-1 configs by score, re-run
+   with 4 follow-up prompts for higher-fidelity measurements.
+3. **Early stopping**: a config is abandoned if it fails, causes OOM, or exceeds
+   `timeout_factor × best_observed_time`.
+4. Results are sorted ascending by end-to-end latency.
 
-1. **Candidate generation**: Starting from `--ctx` (or `--ctx-max`) down to
-   `--ctx-min` in `--ctx-step` increments, the tuner generates candidate
-   configurations.
-2. **Error handling**: When a run fails with VRAM OOM, the tuner automatically
-   reduces `--n-gpu-layers` by `--ngl-step` and retries, up to `--max-retries`
-   times.  If ngl hits the minimum, `--batch-size` is reduced by `--batch-step`
-   before retrying.
-3. **ctx big-step ladder**: When a memory-fit failure line reports that free memory
-   is less than 50% of projected usage, the context is halved (big step) for the
-   next retry instead of using the configured `--ctx-step`.  This avoids wasting
-   many retries when the model clearly cannot fit.
-4. **Early stopping**: A configuration is abandoned if it fails, causes OOM beyond
-   the retry budget, or falls below `--min-tokens-per-sec`.
-5. **Multi-objective selection**: Results are ranked by max usable context, then
-   by throughput near that context level.  The `recommended` config balances
-   both objectives.
+### Continuous Explorer (`explore`)
 
-### Engine Selection and Mismatch Detection
-
-Pass `--engine vulkan` (default) to target Vulkan GPU acceleration, or
-`--engine cpu` for CPU-only inference.
-
-When `--engine vulkan` is active, llama-bench checks the server startup log for
-Vulkan backend lines (e.g. `ggml_vulkan: ...`).  If none are found — meaning the
-server binary was not built with Vulkan support or defaulted to a different
-backend — an **engine mismatch** is flagged:
-
-- In TUI mode: a **red** error entry is shown in the Errors panel.
-- In `--no-tui` mode: a red warning is printed to the console.
-- The `engine_mismatch` field is set to `true` in the JSONL result records.
-
-The run continues regardless; the warning is informational.
-
-### Usability Definition
-
-A configuration is *usable* when **all** of the following hold:
-
-- `tokens/s >= --min-tokens-per-sec` (default **4.0**)
-- `ttft_s <= --max-ttft-s` — only checked when `--max-ttft-s` is explicitly set;
-  **disabled by default** so TTFT alone never causes a rejection
-
-TTFT is always recorded and contributes to ranking between equal-context configs.
-
-### Terminal UI Panels
-
-The TUI (disabled by `--no-tui`) shows these panels:
-
-| Panel | Content |
-|-------|---------|
-| **To-Dos** | Remaining candidate configurations to test |
-| **Current State** | Configuration currently under test |
-| **Progress** | Progress bar with estimated time remaining |
-| **Errors / Warnings** | Errors in **red**, warnings in yellow |
-| **Results** | Rolling table of completed runs (tok/s, status, reason) |
+1. Builds the full `ctx × ngl × batch` Cartesian product each round.
+   Round 1 runs candidates **high-to-low** (most promising first).
+   Subsequent rounds **shuffle** the order so different regions get covered.
+2. Each candidate uses the same OOM-adaptive retry logic as `bench`.
+3. After every completed run the **Hall of Fame** is updated across all five
+   objectives and pushed live to the TUI.
+4. Results are appended to the JSONL output file immediately — nothing is
+   lost when you stop.
+5. Runs until `stop_event` fires (press `q` / `Ctrl+C`).
 
 ### KV-Cache Prefix Reuse Probing
 
-Follow-up messages re-send the same shared prefix (corpus context), allowing
-`--cache-reuse` to kick in if the server has stored the prefix in its KV cache.
-This makes the benchmark sensitive to the `--cache-reuse` threshold and exercises
-cache-hit performance.
+Each prompt sequence includes a long shared prefix (the binary analysis context,
+~600 tokens).  Follow-up messages re-send the same prefix, allowing `--cache-reuse`
+to kick in if the server has stored the prefix in its KV cache.  This makes the
+benchmark sensitive to the `--cache-reuse` threshold.
 
 ### Metrics Collection
 
@@ -351,42 +383,43 @@ cache-hit performance.
 
 ## Output Format
 
-Results are saved as **JSONL** (one JSON object per line) plus a `summary.json`.
-
-Each JSONL line contains:
+Results are saved as **JSONL** (one JSON object per line).  Each line contains:
 
 ```json
 {
-  "run_id": "run_20240101T120000_abcd1234",
+  "run_id": "tune_2024-01-01T12:00:00+00:00",
   "timestamp": "2024-01-01T12:00:00+00:00",
-  "config_hash": "abcd1234",
+  "config": {
+    "server": "/path/to/llama-server",
+    "model": "/path/to/model.gguf",
+    "ctx": 49152,
+    "n_gpu_layers": 41,
+    "batch_size": 1536,
+    "split_mode": "layer",
+    "vk_devices": "0,1"
+  },
   "success": true,
   "failure_reason": null,
-  "engine_mismatch": false,
-  "log_file": "results/llama_bench_20240101T120000.log",
-  "client": {
-    "ttft_ms": 142.3,
-    "end_to_end_latency_ms": 8450.1,
-    "streaming_tok_per_s": 28.4,
-    "total_tokens": 240,
-    "is_streaming": true
-  },
-  "server": {
-    "prompt_eval_time_ms": 1230.5,
-    "prompt_eval_count": 512,
-    "eval_time_ms": 5430.2,
-    "eval_count": 240,
-    "prompt_tok_per_s": 415.7,
-    "decode_tok_per_s": 44.2,
-    "total_time_ms": 6660.7,
-    "has_memory_info": true,
-    "memory_used_mb": 14234.6
-  }
+  "ttft_s": 0.215,
+  "tokens_per_sec": 20.4,
+  "ctx": 49152,
+  "n_gpu_layers": 41,
+  "batch_size": 1536,
+  "stderr_path": "results/server_stderr_20240101T120000.log",
+  "stdout_path": "results/server_stdout_20240101T120000.log",
+  "server_error_excerpt": null,
+  "projected_mib": null,
+  "free_mib": null,
+  "log_file": "results/llama_bench_20240101T120000.log"
 }
 ```
 
-The `summary.json` contains the multi-objective selection: `max_ctx_result`,
-`top_throughput`, and `recommended` configuration.
+Search results additionally wrap each run inside a `metrics` array and include
+`config` (the full BenchConfig dict), `phase`, and `best_score`.
+
+Explorer results use the same per-attempt JSONL schema, appended one line at a time.
+The output file is named `results/explore_<timestamp>.jsonl` by default.
+Query `hall_of_fame` data is displayed in the TUI live but is not persisted to JSONL.
 
 ---
 
@@ -412,6 +445,15 @@ venv's `bin/` directory, causing a *"command not found"* error.
 ```bash
 sudo env PATH="$PATH" llama-bench bench --server /absolute/path/to/llama-server ...
 ```
+
+**Alternative — system-wide symlink:**
+
+```bash
+sudo ln -s "$(which llama-bench)" /usr/local/bin/llama-bench
+```
+
+After creating the symlink, plain `sudo llama-bench ...` works without the
+`env PATH=...` wrapper.
 
 **Best practice:** only the `llama-server` binary needs elevated privileges.
 `llama-bench` itself does not need to run as root; use `--sudo` (the default)
@@ -440,6 +482,13 @@ Version warning: llama-server version mismatch: expected '8133', got '9000'.
 Results may differ from baseline.
 ```
 
+The `--server` path is **always resolved to an absolute path** before version
+detection runs, so `sudo: ./llama-server: command not found` errors can never
+be mis-parsed as a version string.
+
+To suppress the warning, update `EXPECTED_LLAMA_SERVER_VERSION` to match your
+build number (e.g. `"9000"`).
+
 The benchmark will still run regardless; the warning is informational only.
 
 ---
@@ -447,7 +496,7 @@ The benchmark will still run regardless; the warning is informational only.
 ## Troubleshooting: Server Startup Failures
 
 `llama-bench` classifies server startup failures into four categories and
-surfaces them during the tuning loop.
+surfaces them in `bench`, `search`, and `explore` modes.
 
 ### Failure types
 
@@ -471,32 +520,37 @@ When a server startup failure occurs `llama-bench`:
 4. Stores the `stderr_path`, `stdout_path`, and a short `server_error_excerpt`
    in the JSONL result record for inspection.
 
-### Adaptive OOM handling
+### `bench` mode behaviour
 
-When `failure_reason` is `out_of_vram`, the tuner automatically backs off
-`--n-gpu-layers` by `--ngl-step` and retries the same context size, up to
-`--max-retries` times.
+If the server fails to start, `llama-bench bench` exits with a non-zero code
+and prints an actionable error, e.g.:
 
-When the server reports a fit-failure line (projected vs. free memory), the tuner
-uses a **big-step ladder**: if free memory is less than 50% of projected usage, the
-context is halved for the retry; otherwise a proportional reduction is applied.
+```
+Error: Server startup failed (model_not_found).
+  Server stderr log: results/server_stderr_20260101T120000.log
+  Excerpt:
+    gguf_init_from_file: failed to open GGUF file /bad/path.gguf (No such file or directory)
+```
 
-### `model_not_found` is a critical failure
+The JSONL result file is still written so you can inspect it later.
 
-If any attempt fails with `model_not_found`, the tuner exits immediately with
-an actionable error message and the path to the server stderr log.
+### `search` mode behaviour
+
+In search mode startup failures are treated as expected outcomes: the failing
+configuration is marked `success=false` with the appropriate `failure_reason`,
+and the search continues with the next configuration.  This means that an OOM
+failure at high `--n-gpu-layers` values will not abort the whole search.
 
 ### Practical tips
 
 * **`model_not_found`** — pass an absolute path to `--model` and verify the
   file exists: `ls -lh /path/to/model.gguf`.
-* **`out_of_vram`** — reduce `--n-gpu-layers` starting value or widen the
-  `--ngl-step` / `--max-retries` budget so the tuner has more room to adapt.
-  Check free VRAM with `vulkaninfo | grep -i memory`.
-* **Engine mismatch warning** — the server binary does not have Vulkan support
-  compiled in, or the Vulkan ICD is missing.  Try `vulkaninfo` to check Vulkan
-  availability, or rebuild `llama-server` with Vulkan support.
-* **`server_exited`** — inspect the full stderr log for clues.  Common culprits:
-  wrong binary for the hardware, missing Vulkan ICD.
+* **`out_of_vram`** — reduce `--n-gpu-layers` (or let `search` discover the
+  maximum that fits).  Check free VRAM with `vulkaninfo | grep -i memory`.
+* **`server_exited`** — inspect the full stderr log printed in the error
+  message for clues.  Common culprits: wrong binary for the hardware (e.g.
+  CUDA binary on a Vulkan-only machine), missing Vulkan ICD.
 * **`server_startup_timeout`** — the model may be loading from a slow storage
-  device.  The startup timeout is currently fixed at 90 seconds.
+  device.  The startup timeout is currently fixed at 90 seconds; if your
+  hardware is particularly slow, consider using a smaller model or faster
+  storage.
