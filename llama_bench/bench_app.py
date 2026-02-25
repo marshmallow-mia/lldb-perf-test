@@ -620,6 +620,7 @@ class BenchApp(App):
         self,
         hw_monitor: Optional[HWMonitor] = None,
         bench_log_path: Optional[str] = None,
+        stop_event: Optional[object] = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -627,6 +628,7 @@ class BenchApp(App):
         self._state = TUIState()
         self._state.bench_log_path = bench_log_path
         self._ready_event: Optional[object] = None  # set by BenchTUI.run()
+        self._stop_event = stop_event  # set immediately on action_quit
 
     # ------------------------------------------------------------------
     # Layout
@@ -663,6 +665,19 @@ class BenchApp(App):
             import threading
             if isinstance(self._ready_event, threading.Event):
                 self._ready_event.set()
+
+    # ------------------------------------------------------------------
+    # Quit action — override to signal workers BEFORE Textual exits
+    # ------------------------------------------------------------------
+
+    async def action_quit(self) -> None:  # type: ignore[override]
+        """Set stop_event immediately so the worker loop exits, then close TUI."""
+        import threading
+        if self._stop_event is not None and isinstance(
+            self._stop_event, threading.Event
+        ):
+            self._stop_event.set()
+        self.exit()
 
     # ------------------------------------------------------------------
     # Periodic refresh (run on Textual's thread via set_interval)

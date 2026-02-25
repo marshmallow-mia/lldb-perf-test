@@ -229,7 +229,9 @@ class ContinuousExplorer:
         self.stop_event = stop_event
         self.output_path = output_path
         self._hof = HallOfFame()
-
+        # Accumulated results — accessible even if run() hasn't returned yet.
+        # This allows callers to retrieve partial results after an interrupt.
+        self._accumulated_attempts: list[TuneAttempt] = []
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -237,6 +239,11 @@ class ContinuousExplorer:
     @property
     def hall_of_fame(self) -> HallOfFame:
         return self._hof
+
+    @property
+    def accumulated_attempts(self) -> list[TuneAttempt]:
+        """Return a copy of all attempts recorded so far (thread-safe read)."""
+        return list(self._accumulated_attempts)
 
     def run(self) -> list[TuneAttempt]:
         """Run indefinitely until *stop_event* is set; return all attempts."""
@@ -310,7 +317,7 @@ class ContinuousExplorer:
 
                 attempt = self._run_candidate(cfg, prompt_seq)
                 all_attempts.append(attempt)
-
+                self._accumulated_attempts.append(attempt)
                 self._hof.total_tested += 1
                 self._hof.update(attempt)
 
@@ -393,6 +400,13 @@ class ContinuousExplorer:
         return candidates
 
     def _append_result(self, attempt: TuneAttempt) -> None:
+        """Append one result line to the JSONL output (never overwrites).
+
+        ``stop_requested`` attempts are noise — the server was interrupted
+        mid-startup, so no measurements were taken.  Skip them.
+        """
+        if attempt.failure_reason == "stop_requested":
+            return
         """Append one result line to the JSONL output (never overwrites)."""
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)

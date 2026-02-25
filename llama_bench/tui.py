@@ -37,10 +37,10 @@ class BenchTUI:
     ) -> None:
         from llama_bench.bench_app import BenchApp
 
-        self._app = BenchApp(hw_monitor=hw_monitor, bench_log_path=bench_log_path)
-        # Stop event: set by run() when the user quits early.
-        # Pass this to AdaptiveTuner so it breaks its sweep between candidates.
+        # Stop event: set by action_quit (via BenchApp) or run() when user quits.
+        # Must be created before BenchApp so it can be passed in.
         self._stop_event: threading.Event = threading.Event()
+        self._app = BenchApp(hw_monitor=hw_monitor, bench_log_path=bench_log_path, stop_event=self._stop_event)
         # PID of the current llama-server subprocess (or its sudo wrapper).
         # Tracked via the server_starting / run_done events so we can SIGTERM
         # it immediately when the user quits.
@@ -85,6 +85,20 @@ class BenchTUI:
         saved = self._suppress_console_logging()
         self._app.run()  # blocks on main thread until Textual exits
         self._restore_console_logging(saved)
+        # Textual uses an alternate screen; when it exits it sends \x1b[?1049l
+        # which restores the primary screen.  That primary screen may show stale
+        # content or log lines that bled through during the TUI session, so we
+        # explicitly clear it.  We write directly to the stdout fd (same fd
+        # Textual uses) to avoid any Python-level buffering delay.
+        # The writer thread has already been join()ed inside App.run() so all
+        # Textual escape sequences are guaranteed to be in the kernel by now.
+        # \033[2J   = erase entire display
+        # \033[3J   = erase scrollback buffer (supported by xterm/VTE/kitty)
+        # \033[H    = move cursor to top-left
+        try:
+            os.write(sys.stdout.fileno(), b"\033[2J\033[3J\033[H")
+        except OSError:
+            pass
 
         if completed.is_set():
             # Normal completion — work_fn finished before (or triggered) the exit.
@@ -104,13 +118,35 @@ class BenchTUI:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-        # 3. Give the worker a window to finish its current cleanup.
+        # 3. If the server was launched with sudo, the PID tracked is the sudo
+        #    wrapper. Kill its children too by iterating /proc (best-effort).
+        #    Do NOT use os.killpg — the server may share our process group,
+        #    which would kill this Python process and prevent the final report.
+        if pid is not None:
+            try:
+                import subprocess
+                # Use pkill to kill children of pid without killing our own group.
+                subprocess.run(
+                    ["pkill", "-TERM", "-P", str(pid)],
+                    capture_output=True,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+        # 4. Give the worker a window to finish its current cleanup.
         worker.join(timeout=20.0)
         if worker.is_alive():
-            # Worker is stuck (e.g. blocked inside requests) — force exit.
-            sys.exit(0)
-        # Worker finished within the window; return whatever we got (may be None
-        # or a partial list).
+            # Worker is still alive — try harder to interrupt it.
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            worker.join(timeout=5.0)
+        # 5. Return whatever results we have — NEVER sys.exit(0).
+        #    The caller (cli.py) is responsible for generating the final
+        #    report from whatever data is available, including partial results
+        #    accessible via the tuner/explorer/searcher's accumulated_* property.
         if result_holder[0] is not None:
             return result_holder[0]  # type: ignore[return-value]
         return []  # type: ignore[return-value]

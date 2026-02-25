@@ -225,6 +225,15 @@ class AdaptiveTuner:
         self.prompt_seq_override = prompt_seq_override
         self.event_cb = event_cb
         self.stop_event = stop_event
+        # Accumulated results — accessible even if run() hasn't returned yet.
+        # This allows callers to retrieve partial results after an interrupt.
+        self._accumulated_attempts: list[TuneAttempt] = []
+
+    @property
+    def accumulated_attempts(self) -> list[TuneAttempt]:
+        """Return a copy of all attempts recorded so far (thread-safe read)."""
+        return list(self._accumulated_attempts)
+
     def _emit(self, event: str, **data: object) -> None:
         """Fire event to registered callback (silently swallows errors)."""
         if self.event_cb is not None:
@@ -297,6 +306,7 @@ class AdaptiveTuner:
 
             attempt = self._run_with_adaptive_retry(cfg, prompt_seq)
             attempts.append(attempt)
+            self._accumulated_attempts.append(attempt)
 
             logger.info(
                 "Candidate %d/%d ctx=%d ngl=%d batch=%d → %s%s",
@@ -342,6 +352,10 @@ class AdaptiveTuner:
         tried_cfgs: set[tuple] = set()
 
         for attempt_num in range(self.bounds.max_retries + 1):
+            # Abort retry loop if stop was requested.
+            if self.stop_event is not None and self.stop_event.is_set():  # type: ignore[union-attr]
+                logger.info("_run_with_adaptive_retry: stop_event set, aborting retries")
+                break
             cfg_key = (current_cfg.ctx, current_cfg.n_gpu_layers, current_cfg.batch_size,
                        current_cfg.flash_attn)
             if cfg_key in tried_cfgs:
@@ -518,6 +532,7 @@ class AdaptiveTuner:
             log_file=self.log_file,
             max_tokens=self.max_tokens,
             event_cb=lambda ev, d: self._emit(ev, **d),
+            stop_event=self.stop_event,
         )
         run_metrics_list: list[RunMetrics] = runner.run_single(prompt_seq, n_followups=self.n_followups)
 

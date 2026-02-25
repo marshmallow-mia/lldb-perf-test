@@ -57,6 +57,7 @@ class StagedSearcher:
         timeout_factor: float = 3.0,
         progress_cb: Optional[Callable[[int, int, int, str], None]] = None,
         log_file: Optional[str] = None,
+        stop_event: Optional[object] = None,  # threading.Event
     ) -> None:
         self.space = space
         self.base_cfg = base_cfg
@@ -65,10 +66,13 @@ class StagedSearcher:
         self.timeout_factor = timeout_factor
         self.progress_cb = progress_cb
         self.log_file = log_file
+        self.stop_event = stop_event
 
         self._results: list[SearchResult] = []
         self._best_score: float = float("inf")
         self._best_config: Optional[BenchConfig] = None
+        # Accumulated results — accessible even if run() hasn't returned yet.
+        self._accumulated_results: list[SearchResult] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,6 +94,13 @@ class StagedSearcher:
             phase_name="coarse sweep",
             n_followups=2,
         )
+
+        # Check for early quit between phases
+        if self.stop_event is not None and self.stop_event.is_set():  # type: ignore[union-attr]
+            all_results = phase1_results
+            all_results.sort(key=lambda r: r.best_score)
+            self._results = all_results
+            return all_results
 
         # ---- Phase 2: refine top 25% ----
         successful = [r for r in phase1_results if r.best_score < float("inf")]
@@ -116,6 +127,11 @@ class StagedSearcher:
             return None
         return min(successful, key=lambda r: r.best_score).config
 
+    @property
+    def accumulated_results(self) -> list[SearchResult]:
+        """Return a copy of all results recorded so far (thread-safe read)."""
+        return list(self._accumulated_results)
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -133,12 +149,17 @@ class StagedSearcher:
         total = len(configs)
 
         for idx, cfg in enumerate(configs):
+            # Honour cancellation request (user pressed q / Ctrl+C).
+            if self.stop_event is not None and self.stop_event.is_set():  # type: ignore[union-attr]
+                break
+
             if self.progress_cb:
                 self.progress_cb(idx, total, phase, phase_name)
 
             prompt_seq = build_prompt_sequence(n_followups=n_followups)
             runner = BenchmarkRunner(cfg, artifacts_dir=self.artifacts_dir,
-                                     log_file=self.log_file)
+                                     log_file=self.log_file,
+                                     stop_event=self.stop_event)
 
             run_start = time.monotonic()
             try:
@@ -187,6 +208,7 @@ class StagedSearcher:
                     )
 
             results.append(result)
+            self._accumulated_results.append(result)
 
         if self.progress_cb:
             self.progress_cb(total, total, phase, phase_name)

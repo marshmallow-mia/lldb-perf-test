@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import shutil
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,7 +15,6 @@ from rich.console import Console
 
 console = Console(stderr=True)
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -97,6 +98,32 @@ def _print_validation(cfg) -> None:
     warnings = validate_config(cfg)
     for w in warnings:
         console.print(f"[yellow]Config warning:[/] {w}")
+
+
+def _setup_graceful_shutdown() -> tuple[threading.Event, object]:
+    """Install a SIGINT handler for graceful shutdown in no-TUI mode.
+
+    Returns ``(stop_event, original_handler)``.  First Ctrl+C sets the event
+    and restores the original handler so a second Ctrl+C force-kills.
+    """
+    stop_event = threading.Event()
+    original = signal.getsignal(signal.SIGINT)
+
+    def _handler(sig: int, frame: object) -> None:
+        console.print(
+            "\n[yellow]Stopping after current run\u2026 generating final report.[/]"
+        )
+        stop_event.set()
+        # Restore original handler so a second Ctrl+C force-kills.
+        signal.signal(signal.SIGINT, original)
+
+    signal.signal(signal.SIGINT, _handler)
+    return stop_event, original
+
+
+def _restore_signal(original: object) -> None:
+    """Restore the original SIGINT handler."""
+    signal.signal(signal.SIGINT, original)
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +296,20 @@ def bench(
         prompt_seq_override = None
 
     if no_tui:
+        stop_event, orig_handler = _setup_graceful_shutdown()
         tuner = AdaptiveTuner(
             base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
             artifacts_dir=artifacts_dir, log_file=log_file,
             progress_cb=_plain_progress,
             n_followups=n_followups, max_tokens=max_tokens,
             prompt_seq_override=prompt_seq_override,
+            stop_event=stop_event,
         )
         attempts = tuner.run()
+        _restore_signal(orig_handler)
+        # If run() returned empty but partial results exist, use those.
+        if not attempts:
+            attempts = tuner.accumulated_attempts
     else:
         from llama_bench.hw_monitor import HWMonitor
         from llama_bench.tui import BenchTUI
@@ -298,25 +331,12 @@ def bench(
         )
         attempts = tui.run(tuner.run)
         hw_monitor.stop()
-    # Write JSONL (attempts may be [] if user quit early)
-    if attempts:
-        from llama_bench.tuner import _attempt_to_dict as _atd
-        with open(output_path, "w", encoding="utf-8") as fh:
-            for a in attempts:
-                fh.write(_json.dumps(_atd(a)) + "\n")
-        console.print(f"[green]Results saved to[/] {output_path}")
-    else:
-        console.print("[yellow]Bench stopped early — no results saved.[/]")
-        return
+        # If TUI returned empty but partial results exist, use those.
+        if not attempts:
+            attempts = tuner.accumulated_attempts
 
-    # Multi-objective selection
-    selection = select_best_configs(attempts, ctx_pct_threshold=ctx_pct_threshold)
-    write_summary_json(summary_path, attempts, selection)
-    console.print(f"[green]Summary written to[/] {summary_path}")
-
-    # Print final TUI summary
-    _print_tuner_summary(selection)
-
+    # --- Final report generation (always runs, even on early quit) ---
+    _finalize_bench(attempts, output_path, summary_path, ctx_pct_threshold, _json)
     # Abort on critical errors (abort run if no usable configs found due to model not found)
     for a in attempts:
         if a.failure_reason == "model_not_found":
@@ -332,7 +352,44 @@ def bench(
             )
 
 
-def _print_tuner_summary(selection: dict) -> None:
+def _finalize_bench(attempts, output_path, summary_path, ctx_pct_threshold, _json):
+    """Write JSONL + summary + print table.  Runs even on early quit."""
+    from llama_bench.tuner import (
+        _attempt_to_dict as _atd,
+        select_best_configs,
+        write_summary_json,
+    )
+
+    if not attempts:
+        console.print("[yellow]Run stopped before any measurement started — no results.[/]")
+        return
+
+    # Separate true results from stop_requested noise.
+    real_attempts = [a for a in attempts if getattr(a, 'failure_reason', None) != 'stop_requested']
+    if not real_attempts:
+        console.print(
+            "[yellow]Run was stopped before the first measurement completed — no results.[/]\n"
+            "[dim]The server was still starting up when you pressed q.  "
+            "Let the server finish loading before quitting to get results.[/]"
+        )
+        return
+
+    # Always write JSONL (successful + failed-for-real, not stop_requested)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        for a in real_attempts:
+            fh.write(_json.dumps(_atd(a)) + "\n")
+    console.print(f"[green]Results saved to[/] {output_path}")
+
+    # Multi-objective selection + summary
+    selection = select_best_configs(real_attempts, ctx_pct_threshold=ctx_pct_threshold)
+    write_summary_json(summary_path, real_attempts, selection)
+    console.print(f"[green]Summary written to[/] {summary_path}")
+
+    # Print final summary table
+    _print_tuner_summary(selection)
+
+
+def _print_tuner_summary(selection):
     """Print a Rich table summarising the tuner multi-objective selection."""
     from rich.table import Table
 
@@ -341,7 +398,7 @@ def _print_tuner_summary(selection: dict) -> None:
     recommended = selection.get("recommended")
 
     if max_ctx is None:
-        console.print("[yellow]No usable configurations found.[/]")
+        console.print("[yellow]No usable configurations found (all runs failed).[/]")
         return
 
     console.print(f"\n[bold green]Max usable context:[/] {max_ctx.ctx} tokens "
@@ -373,7 +430,6 @@ def _print_tuner_summary(selection: dict) -> None:
             f"ctx={recommended.ctx} ngl={recommended.n_gpu_layers} "
             f"batch={recommended.batch_size} tok/s={recommended.tokens_per_sec:.1f}"
         )
-
 
 # ---------------------------------------------------------------------------
 # search command
@@ -469,6 +525,7 @@ def search(
         console.print(f"[dim]Phase {phase} ({phase_name}): {current}/{total}[/]")
 
     if no_tui:
+        stop_event, orig_handler = _setup_graceful_shutdown()
         searcher = StagedSearcher(
             space=space,
             base_cfg=base_cfg,
@@ -476,8 +533,13 @@ def search(
             max_configs=max_configs,
             progress_cb=_progress_cb,
             log_file=log_file,
+            stop_event=stop_event,
         )
         results = searcher.run()
+        _restore_signal(orig_handler)
+        # If run() returned empty but partial results exist, use those.
+        if not results:
+            results = searcher.accumulated_results
     else:
         from llama_bench.tui import BenchTUI
         tui = BenchTUI(bench_log_path=log_file)
@@ -492,6 +554,7 @@ def search(
             max_configs=max_configs,
             progress_cb=_tui_cb,
             log_file=log_file,
+            stop_event=tui._stop_event,
         )
 
         def _search_work():
@@ -499,19 +562,25 @@ def search(
             best = searcher.best_config()
             if best:
                 scores = [x.best_score for x in r if x.best_score < float("inf")]
-                tui.set_best(f"np={best.np}, ctx={best.ctx}, ngl={best.n_gpu_layers}", 
+                tui.set_best(f"np={best.np}, ctx={best.ctx}, ngl={best.n_gpu_layers}",
                     min(scores) if scores else float("inf"),
                 )
             return r
 
         results = tui.run(_search_work)
-    save_results(results, output_path)
-    console.print(f"[green]Search complete. Results saved to[/] {output_path}")
+        # If TUI returned empty but partial results exist, use those.
+        if not results:
+            results = searcher.accumulated_results
 
-    from llama_bench.report import load_results, print_summary_table
-    loaded = load_results(output_path)
-    print_summary_table(loaded)
-
+    # --- Final report generation (always runs, even on early quit) ---
+    if results:
+        save_results(results, output_path)
+        console.print(f"[green]Search results saved to[/] {output_path}")
+        from llama_bench.report import load_results, print_summary_table
+        loaded = load_results(output_path)
+        print_summary_table(loaded)
+    else:
+        console.print("[yellow]No results to report (stopped before any runs completed).[/]")
 
 # ---------------------------------------------------------------------------
 # report command
@@ -662,14 +731,20 @@ def explore(
     )
 
     if no_tui:
+        stop_event, orig_handler = _setup_graceful_shutdown()
         explorer = ContinuousExplorer(
             base_cfg=base_cfg, bounds=bounds, thresholds=thresholds,
             ngl_values=ngl_values, batch_values=batch_values,
             artifacts_dir=artifacts_dir, log_file=log_file,
             n_followups=n_followups, max_tokens=max_tokens,
             output_path=output_path,
+            stop_event=stop_event,
         )
         attempts = explorer.run()
+        _restore_signal(orig_handler)
+        # If run() returned empty but partial results exist, use those.
+        if not attempts:
+            attempts = explorer.accumulated_attempts
         hof = explorer.hall_of_fame
     else:
         from llama_bench.hw_monitor import HWMonitor
@@ -689,18 +764,29 @@ def explore(
         )
         attempts = tui.run(explorer.run)
         hw_monitor.stop()
+        # If TUI returned empty but partial results exist, use those.
+        if not attempts:
+            attempts = explorer.accumulated_attempts
         hof = explorer.hall_of_fame
+
+    # --- Final report generation (always runs, even on early quit) ---
+    # Filter out stop_requested noise — those are mid-startup interrupts with no data.
+    real_attempts = [a for a in attempts if getattr(a, 'failure_reason', None) != 'stop_requested']
 
     console.print(
         f"\n[bold]Explorer stopped[/] after {hof.total_tested} configs "
         f"across {hof.round_num} round(s)."
     )
-    _print_hof_summary(hof)
-    if attempts:
+
+    if real_attempts:
+        _print_hof_summary(hof)
         console.print(f"[green]Results saved to[/] {output_path}")
     else:
-        console.print("[yellow]No results saved (stopped before any completed).[/]")
-
+        console.print(
+            "[yellow]Run was stopped before the first measurement completed — no results.[/]\n"
+            "[dim]The server was still loading when you pressed q.  "
+            "Wait for the server to finish loading (watch the Activity log) before quitting.[/]"
+        )
 
 def _print_hof_summary(hof) -> None:
     """Print the Hall of Fame as a Rich table."""

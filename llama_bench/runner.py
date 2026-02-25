@@ -167,6 +167,7 @@ def wait_for_server_ready(
     timeout: float = 60.0,
     proc: Optional[subprocess.Popen] = None,
     event_cb: Optional[Callable] = None,
+    stop_event: Optional[object] = None,
 ) -> Optional[str]:
     """Poll ``GET /health`` until 200 OK or *timeout* seconds elapse.
 
@@ -181,6 +182,10 @@ def wait_for_server_ready(
     attempt = 0
 
     while time.monotonic() < deadline:
+        # Abort immediately if stop was requested.
+        if stop_event is not None and stop_event.is_set():  # type: ignore[union-attr]
+            logger.info("wait_for_server_ready: stop_event set, aborting")
+            return "stop_requested"
         # Check if the process died before we could connect.
         if proc is not None and proc.poll() is not None:
             logger.warning("Server process exited (rc=%d) during readiness wait", proc.returncode)
@@ -197,7 +202,12 @@ def wait_for_server_ready(
             logger.debug("Health check attempt %d: HTTP %d", attempt, resp.status_code)
         except requests.RequestException as exc:
             logger.debug("Health check attempt %d: %s", attempt, exc)
-        time.sleep(1.0)
+        # Use stop_event.wait() instead of time.sleep() so that setting the
+        # event wakes us up immediately rather than sleeping for a full second.
+        if stop_event is not None:
+            stop_event.wait(timeout=1.0)
+        else:
+            time.sleep(1.0)
 
     logger.warning("Server did not become ready within %.0fs (%d attempts)", timeout, attempt)
     return "server_startup_timeout"
@@ -207,22 +217,30 @@ def wait_for_server_ready(
 # stop_server
 # ---------------------------------------------------------------------------
 
-def stop_server(handle: ServerHandle) -> None:
-    """Terminate the server process gracefully, force-killing if needed."""
+def stop_server(handle: ServerHandle, already_signalled: bool = False) -> None:
+    """Terminate the server process gracefully, force-killing if needed.
+
+    Args:
+        handle: The server handle returned by start_server.
+        already_signalled: If True, SIGTERM was already sent externally (e.g. by
+            tui.py on user-quit), so skip straight to SIGKILL with a short wait.
+    """
     proc = handle.process
     if proc.poll() is not None:
         return  # already exited
 
-    proc.terminate()
+    if not already_signalled:
+        proc.terminate()
     try:
-        proc.wait(timeout=10)
+        # 2 s is ample — llama-server exits within milliseconds of SIGTERM.
+        # The old 10 s timeout was the source of the ~10 s delay after 'q'.
+        proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             logger.warning("Server process %d did not die after SIGKILL", handle.pid)
-
 
 # ---------------------------------------------------------------------------
 # Version helpers
@@ -302,12 +320,14 @@ class BenchmarkRunner:
     def __init__(self, cfg: BenchConfig, artifacts_dir: str = "results",
                  log_file: Optional[str] = None,
                  max_tokens: int = 512,
-                 event_cb: Optional[Callable[[str, dict], None]] = None) -> None:
+                 event_cb: Optional[Callable[[str, dict], None]] = None,
+                 stop_event: Optional[object] = None) -> None:
         self.cfg = cfg
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
         self.max_tokens = max_tokens
         self._event_cb = event_cb
+        self._stop_event = stop_event
         os.makedirs(artifacts_dir, exist_ok=True)
 
     def _emit(self, event: str, **data: object) -> None:
@@ -337,6 +357,7 @@ class BenchmarkRunner:
                 self.cfg.host, self.cfg.port, timeout=90.0,
                 proc=handle.process,
                 event_cb=lambda ev, d: self._emit(ev, **d),
+                stop_event=self._stop_event,
             )
 
             if startup_failure is not None:
@@ -369,6 +390,10 @@ class BenchmarkRunner:
 
             self._emit("server_ready")
             for idx, item in enumerate(prompt_sequence):
+                # Abort prompt loop if stop was requested.
+                if self._stop_event is not None and self._stop_event.is_set():  # type: ignore[union-attr]
+                    logger.info("run_single: stop_event set, aborting prompt loop")
+                    break
                 messages = item.get("messages", [])
                 run_id = _make_run_id(self.cfg)
                 ts = datetime.now(timezone.utc).isoformat()
