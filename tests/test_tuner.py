@@ -281,3 +281,45 @@ class TestGenerateCandidates:
         candidates = tuner._generate_candidates()
         assert len(candidates) == 1
         assert candidates[0].ctx == 49152
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveTuner — new params: n_followups, max_tokens, prompt_seq_override
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveTunerNewParams:
+
+    def _make_tuner(self, **kwargs):
+        bounds = TunerBounds(ctx_min=8192, ctx_max=8192, ctx_step=8192)
+        cfg = BenchConfig(model_path="/tmp/model.gguf")
+        return AdaptiveTuner(
+            base_cfg=cfg, bounds=bounds, thresholds=TunerThresholds(),
+            artifacts_dir="/tmp",
+            **kwargs,
+        )
+
+    def test_default_n_followups_is_4(self):
+        tuner = self._make_tuner()
+        assert tuner.n_followups == 4
+
+    def test_custom_n_followups(self):
+        tuner = self._make_tuner(n_followups=2)
+        assert tuner.n_followups == 2
+
+    def test_default_max_tokens_is_512(self):
+        tuner = self._make_tuner()
+        assert tuner.max_tokens == 512
+
+    def test_custom_max_tokens(self):
+        tuner = self._make_tuner(max_tokens=128)
+        assert tuner.max_tokens == 128
+
+    def test_prompt_seq_override_stored(self):
+        override = [{"messages": [{"role": "user", "content": "test"}], "is_followup": False,
+                     "expected_prefix_len_tokens": 1}]
+        tuner = self._make_tuner(prompt_seq_override=override)
+        assert tuner.prompt_seq_override is override
+
+    def test_prompt_seq_override_default_none(self):
+        tuner = self._make_tuner()
+        assert tuner.prompt_seq_override is None

@@ -52,13 +52,9 @@ class TunerBounds:
 
 @dataclass
 class TunerThresholds:
-    """Minimum performance thresholds that define a "usable" config.
+    """Minimum performance thresholds that define a "usable" config."""
 
-    ``max_ttft_s=None`` disables TTFT gating entirely; TTFT is still recorded
-    and used for ranking but does not cause a config to be rejected.
-    """
-
-    max_ttft_s: Optional[float] = None  # None = TTFT gating disabled by default
+    max_ttft_s: Optional[float] = None
     min_tokens_per_sec: float = 4.0
 
 
@@ -71,6 +67,8 @@ class TuneAttempt:
     failure_reason: Optional[str] = None
     ttft_s: float = 0.0
     tokens_per_sec: float = 0.0
+    cold_ttft_s: float = 0.0
+    warm_ttft_s: float = 0.0
     ctx: int = 0
     n_gpu_layers: int = 0
     batch_size: int = 0
@@ -210,7 +208,11 @@ class AdaptiveTuner:
         artifacts_dir: str = "results",
         log_file: Optional[str] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
+        n_followups: int = 4,
         max_tokens: int = 512,
+        prompt_seq_override: Optional[list] = None,
+        event_cb: Optional[Callable[[str, dict], None]] = None,
+        stop_event: Optional[object] = None,  # threading.Event
     ) -> None:
         self.base_cfg = base_cfg
         self.bounds = bounds
@@ -218,10 +220,18 @@ class AdaptiveTuner:
         self.artifacts_dir = artifacts_dir
         self.log_file = log_file
         self.progress_cb = progress_cb
+        self.n_followups = n_followups
         self.max_tokens = max_tokens
-        # Single consolidated server log files for the entire tuning run
-        self._server_log_stdout = os.path.join(artifacts_dir, "server_stdout.log")
-        self._server_log_stderr = os.path.join(artifacts_dir, "server_stderr.log")
+        self.prompt_seq_override = prompt_seq_override
+        self.event_cb = event_cb
+        self.stop_event = stop_event
+    def _emit(self, event: str, **data: object) -> None:
+        """Fire event to registered callback (silently swallows errors)."""
+        if self.event_cb is not None:
+            try:
+                self.event_cb(event, dict(data))
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # Public API
@@ -231,17 +241,59 @@ class AdaptiveTuner:
         """Execute the tuner sweep; return all attempt records."""
         from llama_bench.prompts import build_prompt_sequence
 
+        # Emit base config so the TUI Settings panel can display it.
+        self._emit(
+            "bench_settings",
+            model=os.path.basename(self.base_cfg.model_path),
+            model_path=self.base_cfg.model_path,
+            ctx_max=self.bounds.ctx_max,
+            ctx_min=self.bounds.ctx_min,
+            ngl_initial=self.base_cfg.n_gpu_layers,
+            batch=self.base_cfg.batch_size,
+            ubatch=self.base_cfg.ubatch_size,
+            flash_attn=self.base_cfg.flash_attn,
+            kv_unified=self.base_cfg.kv_unified,
+            cache_reuse=self.base_cfg.cache_reuse,
+            cache_type_k=self.base_cfg.cache_type_k,
+            cache_type_v=self.base_cfg.cache_type_v,
+            split_mode=self.base_cfg.split_mode,
+            vk_devices=self.base_cfg.vk_visible_devices,
+            np=self.base_cfg.np,
+            threads=self.base_cfg.threads,
+            threads_batch=self.base_cfg.threads_batch,
+            cont_batching=self.base_cfg.cont_batching,
+            max_retries=self.bounds.max_retries,
+        )
+
+        if self.prompt_seq_override is not None:
+            prompt_seq = self.prompt_seq_override
+        else:
+            prompt_seq = build_prompt_sequence(n_followups=self.n_followups)
+
         candidates = self._generate_candidates()
         attempts: list[TuneAttempt] = []
-        prompt_seq = build_prompt_sequence(n_followups=4)
+
 
         total = len(candidates)
         logger.info("AdaptiveTuner: %d candidate configs (ctx %d→%d step %d)",
                     total, self.bounds.ctx_max, self.bounds.ctx_min, self.bounds.ctx_step)
 
         for idx, cfg in enumerate(candidates):
+            # Honour cancellation request (user pressed q in TUI).
+            if self.stop_event is not None and self.stop_event.is_set():  # type: ignore[union-attr]
+                logger.info("AdaptiveTuner: stop_event set, aborting sweep at idx %d", idx)
+                break
+
             if self.progress_cb:
                 self.progress_cb(idx, total)
+
+            self._emit(
+                "run_start",
+                ctx=cfg.ctx,
+                ngl=cfg.n_gpu_layers,
+                batch=cfg.batch_size,
+                phase_desc=f"ctx sweep  [{idx + 1}/{total}]",
+            )
 
             attempt = self._run_with_adaptive_retry(cfg, prompt_seq)
             attempts.append(attempt)
@@ -330,6 +382,26 @@ class AdaptiveTuner:
                 if next_cfg is None:
                     logger.debug("No further adaptation possible; stopping retries.")
                     break
+                # Describe what changed for the TUI retry log
+                changes: list[str] = []
+                if next_cfg.n_gpu_layers != current_cfg.n_gpu_layers:
+                    changes.append(f"ngl {current_cfg.n_gpu_layers}→{next_cfg.n_gpu_layers}")
+                if next_cfg.batch_size != current_cfg.batch_size:
+                    changes.append(f"batch {current_cfg.batch_size}→{next_cfg.batch_size}")
+                if next_cfg.ctx != current_cfg.ctx:
+                    changes.append(f"ctx {current_cfg.ctx}→{next_cfg.ctx}")
+                if not next_cfg.flash_attn and current_cfg.flash_attn:
+                    changes.append("flash_attn off")
+                self._emit(
+                    "retry",
+                    attempt=attempt_num + 1,
+                    max_retries=self.bounds.max_retries,
+                    reason=last_attempt.failure_reason or "oom",
+                    change=", ".join(changes) or "?",
+                    ctx=next_cfg.ctx,
+                    ngl=next_cfg.n_gpu_layers,
+                    batch=next_cfg.batch_size,
+                )
                 current_cfg = next_cfg
 
         return last_attempt or TuneAttempt(
@@ -387,7 +459,7 @@ class AdaptiveTuner:
             if projected_mib > 0 and free_mib < projected_mib:
                 ratio = free_mib / projected_mib
                 if ratio < 0.5:
-                    # Memory way too low — big-step ladder (J2): halve ctx
+                    # Memory way too low — big-step ladder: halve ctx
                     new_ctx = cfg.ctx // 2
                     new_ctx = (new_ctx // self.bounds.ctx_step) * self.bounds.ctx_step
                     logger.debug(
@@ -404,6 +476,13 @@ class AdaptiveTuner:
                         "(projected=%.0f MiB free=%.0f MiB ratio=%.2f)",
                         cfg.ctx, new_ctx, projected_mib, free_mib, ratio,
                     )
+                # Round down to ctx_step boundary
+                new_ctx = (new_ctx // self.bounds.ctx_step) * self.bounds.ctx_step
+                logger.debug(
+                    "OOM adaptation (heuristic): ctx %d → %d "
+                    "(projected=%.0f MiB free=%.0f MiB ratio=%.2f)",
+                    cfg.ctx, new_ctx, projected_mib, free_mib, ratio,
+                )
                 if new_ctx >= self.bounds.ctx_min and new_ctx < cfg.ctx:
                     new_cfg = copy.deepcopy(cfg)
                     new_cfg.ctx = new_ctx
@@ -435,15 +514,12 @@ class AdaptiveTuner:
         prompt_seq: list[dict],
     ) -> TuneAttempt:
         """Run one server instance and return a :class:`TuneAttempt`."""
-        runner = BenchmarkRunner(
-            cfg,
-            artifacts_dir=self.artifacts_dir,
+        runner = BenchmarkRunner(cfg, artifacts_dir=self.artifacts_dir,
             log_file=self.log_file,
-            server_log_stdout=self._server_log_stdout,
-            server_log_stderr=self._server_log_stderr,
             max_tokens=self.max_tokens,
+            event_cb=lambda ev, d: self._emit(ev, **d),
         )
-        run_metrics_list: list[RunMetrics] = runner.run_single(prompt_seq, n_followups=4)
+        run_metrics_list: list[RunMetrics] = runner.run_single(prompt_seq, n_followups=self.n_followups)
 
         ts = datetime.now(timezone.utc).isoformat()
 
@@ -514,7 +590,15 @@ class AdaptiveTuner:
                 log_file=self.log_file,
             )
 
-        # Average metrics across successful runs
+        # Cold TTFT = first (initial) request; Warm TTFT = avg of follow-ups
+        cold_ttft_s = successful[0].client.ttft_ms / 1000.0 if successful else 0.0
+        warm_runs = successful[1:] if len(successful) > 1 else []
+        warm_ttft_s = (
+            sum(m.client.ttft_ms for m in warm_runs) / len(warm_runs) / 1000.0
+            if warm_runs else 0.0
+        )
+
+        # Overall average (kept for backward compat / threshold check)
         avg_ttft_s = (
             sum(m.client.ttft_ms for m in successful) / len(successful) / 1000.0
         )
@@ -523,27 +607,26 @@ class AdaptiveTuner:
         )
 
         # Check performance thresholds
-        # TTFT gating is disabled when max_ttft_s is None (still recorded for ranking).
-        ttft_ok = (
-            self.thresholds.max_ttft_s is None
-            or avg_ttft_s <= self.thresholds.max_ttft_s
+        usable = (
+            (self.thresholds.max_ttft_s is None or avg_ttft_s <= self.thresholds.max_ttft_s)
+            and avg_tps >= self.thresholds.min_tokens_per_sec
         )
-        usable = ttft_ok and avg_tps >= self.thresholds.min_tokens_per_sec
         failure_reason: Optional[str] = None
         if not usable:
-            if not ttft_ok:
+            if self.thresholds.max_ttft_s is not None and avg_ttft_s > self.thresholds.max_ttft_s:
                 failure_reason = "ttft_exceeded"
             else:
                 failure_reason = "throughput_too_low"
 
-        engine_mismatch = any(m.engine_mismatch for m in successful)
         best = successful[0]
-        return TuneAttempt(
+        attempt = TuneAttempt(
             config=cfg,
             success=usable,
             failure_reason=failure_reason,
             ttft_s=avg_ttft_s,
             tokens_per_sec=avg_tps,
+            cold_ttft_s=cold_ttft_s,
+            warm_ttft_s=warm_ttft_s,
             ctx=cfg.ctx,
             n_gpu_layers=cfg.n_gpu_layers,
             batch_size=cfg.batch_size,
@@ -552,5 +635,16 @@ class AdaptiveTuner:
             run_id=best.run_id,
             timestamp=best.timestamp,
             log_file=self.log_file,
-            engine_mismatch=engine_mismatch,
         )
+        self._emit(
+            "run_done",
+            ctx=attempt.ctx,
+            ngl=attempt.n_gpu_layers,
+            batch=attempt.batch_size,
+            cold_ttft_s=cold_ttft_s,
+            warm_ttft_s=warm_ttft_s,
+            tokens_per_sec=avg_tps,
+            success=usable,
+            reason=failure_reason,
+        )
+        return attempt

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llama_bench.runner import get_server_version
+from llama_bench.runner import get_server_version, _build_server_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -257,3 +257,49 @@ class TestWaitForServerReady:
         with patch("requests.get", return_value=mock_resp):
             result = self._fn()("localhost", 5001, timeout=5.0)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _build_server_cmd — max_predict_tokens in -n flag
+# ---------------------------------------------------------------------------
+
+class TestBuildServerCmd:
+    """Unit tests for _build_server_cmd with max_predict_tokens."""
+
+    def _make_cfg(self, **kwargs):
+        from llama_bench.config import BenchConfig
+        defaults = dict(model_path="/tmp/m.gguf", server_binary="/bin/srv",
+                        host="0.0.0.0", port=5001, use_sudo=False,
+                        vk_visible_devices="0", np=1, ctx=4096,
+                        n_gpu_layers=10, flash_attn=True, batch_size=512,
+                        ubatch_size=128, cache_type_k="q8_0",
+                        cache_type_v="q8_0", kv_unified=True,
+                        cache_reuse=512, cont_batching=True,
+                        threads=4, threads_batch=4, split_mode="none",
+                        max_predict_tokens=256)
+        defaults.update(kwargs)
+        return BenchConfig(**defaults)
+
+    def test_n_flag_uses_max_predict_tokens(self):
+        """Server -n flag must equal cfg.max_predict_tokens, not hardcoded 4096."""
+        cfg = self._make_cfg(max_predict_tokens=128)
+        cmd = _build_server_cmd(cfg)
+        assert "-n" in cmd
+        n_idx = cmd.index("-n")
+        assert cmd[n_idx + 1] == "128"
+
+    def test_n_flag_default_is_512(self):
+        cfg = self._make_cfg(max_predict_tokens=512)
+        cmd = _build_server_cmd(cfg)
+        n_idx = cmd.index("-n")
+        assert cmd[n_idx + 1] == "512"
+
+    def test_no_sudo_when_disabled(self):
+        cfg = self._make_cfg(use_sudo=False)
+        cmd = _build_server_cmd(cfg)
+        assert cmd[0] != "sudo"
+
+    def test_sudo_prepended_when_enabled(self):
+        cfg = self._make_cfg(use_sudo=True)
+        cmd = _build_server_cmd(cfg)
+        assert cmd[0] == "sudo"
