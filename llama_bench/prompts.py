@@ -317,3 +317,247 @@ def load_prompt_pack(path: str) -> list[dict]:
         raise ValueError(f"Prompt pack {path!r} must be a JSON/YAML list at the top level.")
 
     return data
+
+
+# ---------------------------------------------------------------------------
+# Preset prompt builders for the 4-preset bench characterization system
+# ---------------------------------------------------------------------------
+
+_FASTEST_RESPONSE_SYSTEM = """\
+You are a senior software engineer specialising in performance-critical systems, \
+compiler optimisation, and low-level programming. You give direct, concise answers.
+"""
+
+_FASTEST_RESPONSE_USER = """\
+Review the following C function and answer these questions concisely:
+
+```c
+static int classify_packet(const uint8_t *buf, size_t len,
+                            uint32_t *out_type, uint32_t *out_flags) {
+    if (!buf || len < 4) return -EINVAL;
+    uint32_t hdr = *(const uint32_t *)buf;  /* unaligned read */
+    *out_type  = (hdr >> 24) & 0xFF;
+    *out_flags = (hdr >> 16) & 0xFF;
+    if (*out_type == 0 || *out_type > 127) return -EPROTO;
+    return (int)(len - 4);
+}
+```
+
+1. What does this function do?
+2. Is the unaligned read safe on x86-64? On ARM64 with strict alignment?
+3. What is the return value semantics?
+"""
+
+
+def build_fastest_response_prompt(use_system: bool = True) -> list[dict]:
+    """Short prompt optimised for measuring cold TTFT.
+
+    A single-turn request (~250 tokens total) with a concise code-review
+    question.  No follow-ups — the goal is to isolate first-token latency.
+
+    Returns a list with one message-sequence dict.
+    """
+    messages: list[dict] = []
+    if use_system:
+        messages.append({"role": "system", "content": _FASTEST_RESPONSE_SYSTEM})
+    messages.append({"role": "user", "content": _FASTEST_RESPONSE_USER})
+
+    return [
+        {
+            "messages": messages,
+            "is_followup": False,
+            "expected_prefix_len_tokens": estimate_token_count(_FASTEST_RESPONSE_USER),
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Throughput preset: long generation, single turn
+# ---------------------------------------------------------------------------
+
+_THROUGHPUT_SYSTEM = """\
+You are an expert technical writer and software architect. \
+You produce comprehensive, detailed documentation. \
+Always write in full, complete sentences and provide extensive explanations.
+"""
+
+_THROUGHPUT_USER = """\
+Write a comprehensive technical design document for a high-performance \
+network packet processing pipeline. Cover the following in detail:
+
+1. **Architecture overview**: data plane vs control plane separation, \
+   ring buffer design, DPDK/XDP considerations.
+2. **Zero-copy techniques**: scatter-gather DMA, huge pages, NUMA-aware \
+   memory allocation, mbuf pools.
+3. **Concurrency model**: RSS hash-based flow steering, per-core queues, \
+   lock-free SPSC/MPSC ring buffers, memory ordering guarantees.
+4. **Packet classification**: hardware offload (RSS, flow director), \
+   software classification (longest-prefix match, hash tables, BPF).
+5. **Batching strategies**: bulk Rx/Tx, adaptive interrupt coalescing, \
+   polling vs interrupt mode thresholds.
+6. **Error handling**: CRC errors, buffer exhaustion, backpressure mechanisms.
+7. **Observability**: per-queue counters, latency histograms, eBPF-based \
+   tracing without modifying the fast path.
+8. **Performance targets**: 10 Gbps line rate at 64-byte packets (14.88 Mpps), \
+   latency budget breakdown, profiling methodology.
+
+Be thorough and include pseudo-code or data structure definitions where appropriate.
+"""
+
+
+def build_throughput_prompt(use_system: bool = True) -> list[dict]:
+    """Long-generation prompt optimised for measuring decode throughput.
+
+    A single-turn request with a complex question designed to elicit a long,
+    detailed response.  No follow-ups — the goal is to maximise tokens/s
+    measurement accuracy.
+
+    Returns a list with one message-sequence dict.
+    """
+    messages: list[dict] = []
+    if use_system:
+        messages.append({"role": "system", "content": _THROUGHPUT_SYSTEM})
+    messages.append({"role": "user", "content": _THROUGHPUT_USER})
+
+    return [
+        {
+            "messages": messages,
+            "is_followup": False,
+            "expected_prefix_len_tokens": estimate_token_count(_THROUGHPUT_USER),
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Max context preset: short question, context size is the variable
+# ---------------------------------------------------------------------------
+
+_MAX_CONTEXT_SYSTEM = """\
+You are a concise assistant. Answer in one sentence.
+"""
+
+_MAX_CONTEXT_USER = "What is the capital of France?"
+
+
+def build_max_context_prompt(use_system: bool = True) -> list[dict]:
+    """Minimal prompt for the max_context preset.
+
+    The point of this preset is to find the highest context that *fits in VRAM*.
+    The actual prompt content is trivial — we want the context window allocated,
+    not a realistic workload.  Short prompt, max_tokens=32 keeps the run fast.
+
+    Returns a list with one message-sequence dict.
+    """
+    messages: list[dict] = []
+    if use_system:
+        messages.append({"role": "system", "content": _MAX_CONTEXT_SYSTEM})
+    messages.append({"role": "user", "content": _MAX_CONTEXT_USER})
+
+    return [
+        {
+            "messages": messages,
+            "is_followup": False,
+            "expected_prefix_len_tokens": estimate_token_count(_MAX_CONTEXT_USER),
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Long context RAG preset: padded context, single question at end
+# ---------------------------------------------------------------------------
+
+# Repeated paragraph used as filler to occupy the context window.
+# Deliberately generic / low-information so the model focuses on the question.
+_RAG_PADDING_PARAGRAPH = """\
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor \
+incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud \
+exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure \
+dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. \
+Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt \
+mollit anim id est laborum. Pellentesque habitant morbi tristique senectus et netus et \
+malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies \
+eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean \
+ultricies mi vitae est. Mauris placerat eleifend leo. Quisque sit amet est et sapien \
+ullamcorper pharetra. Vestibulum erat wisi, condimentum sed, commodo vitae, ornare sit \
+amet, wisi. Aenean fermentum, elit eget tincidunt condimentum, eros ipsum rutrum orci, \
+sagittis tempus lacus enim ac dui. Donec non enim in turpis pulvinar facilisis. Ut felis.
+"""
+
+_RAG_QUESTION = "Based on the documents above, what is the main topic being discussed?"
+
+_RAG_FOLLOWUP = (
+    "Summarise the key points from the documents above in three bullet points."
+)
+
+_RAG_SYSTEM = """\
+You are a research assistant. Summarise and answer questions about the provided \
+documents. Be concise and accurate.
+"""
+
+
+def _build_padded_rag_context(target_tokens: int) -> str:
+    """Build a padded document context targeting approximately *target_tokens* tokens.
+
+    Repeats :data:`_RAG_PADDING_PARAGRAPH` until the estimated token count reaches
+    (or slightly exceeds) *target_tokens*.  The question is appended at the end so
+    the model must process the full context before generating the answer.
+
+    Args:
+        target_tokens: Desired size of the filler portion in tokens.
+
+    Returns:
+        A string: repeated paragraphs + question.
+    """
+    para_tokens = estimate_token_count(_RAG_PADDING_PARAGRAPH)
+    if para_tokens <= 0:
+        para_tokens = 1
+    reps = max(1, target_tokens // para_tokens)
+    padding = (_RAG_PADDING_PARAGRAPH.strip() + "\n\n") * reps
+    return padding + _RAG_QUESTION
+
+
+def build_long_context_rag_prompt(
+    padding_tokens: int = 28000,
+    use_system: bool = True,
+) -> list[dict]:
+    """Build a prompt sequence for the long_context_rag preset.
+
+    The user message is a large padded document context followed by a short
+    question.  One follow-up is included to test warm-cache TTFT at large ctx.
+
+    Args:
+        padding_tokens: Approximate number of filler tokens to generate.
+                        Should be set by PresetRunner to fill (ctx - overhead).
+        use_system:     Whether to include the system message.
+
+    Returns:
+        A list of two message-sequence dicts: initial + one follow-up.
+    """
+    full_context = _build_padded_rag_context(padding_tokens)
+    prefix_tokens = estimate_token_count(full_context)
+
+    initial_messages: list[dict] = []
+    if use_system:
+        initial_messages.append({"role": "system", "content": _RAG_SYSTEM})
+    initial_messages.append({"role": "user", "content": full_context})
+
+    followup_messages: list[dict] = []
+    if use_system:
+        followup_messages.append({"role": "system", "content": _RAG_SYSTEM})
+    # Re-send the full context for the follow-up so the KV cache prefix is reused.
+    followup_messages.append(
+        {"role": "user", "content": full_context + "\n\n" + _RAG_FOLLOWUP}
+    )
+
+    return [
+        {
+            "messages": initial_messages,
+            "is_followup": False,
+            "expected_prefix_len_tokens": prefix_tokens,
+        },
+        {
+            "messages": followup_messages,
+            "is_followup": True,
+            "expected_prefix_len_tokens": prefix_tokens,
+        },
+    ]

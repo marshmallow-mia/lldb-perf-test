@@ -75,7 +75,10 @@ class BenchTUI:
             finally:
                 completed.set()
                 try:
-                    self._app.call_from_thread(self._app.exit)
+                    # Signal completion — do NOT call app.exit here.
+                    # The TUI stays open so the user can read results.
+                    # The user closes it by pressing q.
+                    self._app.call_from_thread(self._app._on_bench_complete)
                 except Exception:
                     pass
 

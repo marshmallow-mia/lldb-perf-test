@@ -25,6 +25,7 @@ from textual.containers import Horizontal
 from textual.widgets import Footer, Header, Static
 
 from llama_bench.hw_monitor import HWMonitor, HWSnapshot, shorten_gpu_name
+from llama_bench import __version__, GIT_TIMESTAMP
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,18 @@ _REASON_LABELS: dict[str, str] = {
     "oom": "OOM",
 }
 
+# Fix hints shown alongside failure labels
+_REASON_HINTS: dict[str, str] = {
+    "out_of_vram": "Reduce --n-gpu-layers or --ctx",
+    "server_exited": "Check server log for missing libs or wrong binary",
+    "server_startup_timeout": "Model may be loading slowly — try a smaller ctx or faster storage",
+    "ttft_exceeded": "Reduce --ctx or lower --n-gpu-layers to free compute headroom",
+    "throughput_too_low": "Reduce --ctx or increase --n-gpu-layers to offload more layers",
+    "model_not_found": "Verify the model path exists and is readable",
+    "http_error": "Server returned an unexpected HTTP error — check server log",
+    "oom": "Reduce --n-gpu-layers or --batch-size",
+}
+
 
 # ---------------------------------------------------------------------------
 # Shared state (written by main thread, read by Textual thread)
@@ -123,6 +136,7 @@ class TUIState:
     server_command: str = ""
     server_log_path: Optional[str] = None
     run_start_time: float = 0.0
+    run_end_time: float = 0.0   # set when bench completes; freezes the elapsed timer
     sweep_start_time: float = 0.0
     progress_current: int = 0
     progress_total: int = 1
@@ -172,17 +186,21 @@ class CurrentRunWidget(Static):
             )
         if state.request_step:
             t.append("        ", style="dim")
-            t.append("► ", style="bold yellow")
+            t.append("\u25ba ", style="bold yellow")
             t.append(state.request_step + "\n", style="yellow")
         if state.run_start_time > 0:
-            elapsed = time.monotonic() - state.run_start_time
+            # Freeze elapsed once benchmark is done; don't let it keep ticking.
+            if state.run_end_time > 0:
+                elapsed = state.run_end_time - state.run_start_time
+            else:
+                elapsed = time.monotonic() - state.run_start_time
             t.append("Elapsed ", style="dim")
             t.append(_fmt_dur(elapsed) + "\n", style="green")
         eta = _compute_eta(state)
         if eta is not None:
             t.append("ETA     ", style="dim")
             t.append("~" + _fmt_dur(eta), style="green")
-        self.update(t if t.plain else Text("(waiting for first run…)", style="dim"))
+        self.update(t if t.plain else Text("(waiting for first run\u2026)", style="dim"))
 
 
 class HardwareWidget(Static):
@@ -303,6 +321,17 @@ class SettingsWidget(Static):
             f"{settings.get('threads_batch','?')} batch\n",
             style="white",
         )
+
+        # Goal + weights (bench mode only)
+        goal_name = settings.get("goal")
+        weights = settings.get("weights")
+        if goal_name:
+            t.append("Goal     ", style="dim")
+            t.append(goal_name + "\n", style="bold cyan")
+        if weights:
+            t.append("Weights  ", style="dim")
+            w_str = "  ".join(f"{k}:{v}" for k, v in weights.items())
+            t.append(w_str + "\n", style="white")
 
         self.update(t)
 
@@ -432,17 +461,23 @@ class ResultsWidget(Static):
         table.add_column("tok/s", justify="right", min_width=6)
         table.add_column("Trend", min_width=8)
         table.add_column("Peak VRAM", justify="right", min_width=9)
-        table.add_column("", justify="center", min_width=2)
+        table.add_column("Status", justify="left", min_width=10)
 
         for i, r in enumerate(state.results[-12:]):
             ok = r.get("success", False)
-            cold = f"{r['cold_ttft_s']:.2f}s" if r.get("cold_ttft_s") else "—"
-            warm = f"{r['warm_ttft_s']:.3f}s" if r.get("warm_ttft_s") else "—"
-            tps = f"{r['tokens_per_sec']:.1f}" if r.get("tokens_per_sec") else "—"
+            cold = f"{r['cold_ttft_s']:.2f}s" if r.get("cold_ttft_s") else "\u2014"
+            warm = f"{r['warm_ttft_s']:.3f}s" if r.get("warm_ttft_s") else "\u2014"
+            tps = f"{r['tokens_per_sec']:.1f}" if r.get("tokens_per_sec") else "\u2014"
             trend = _sparkline(state.tps_history[: i + 1])
             peak_gb = r.get("peak_vram_mb", 0.0) / 1024
-            peak = f"{peak_gb:.1f} GB" if peak_gb > 0 else "—"
-            status = "[green]✓[/]" if ok else "[red]✗[/]"
+            peak = f"{peak_gb:.1f} GB" if peak_gb > 0 else "\u2014"
+            if ok:
+                status = "[green]\u2713[/]"
+            else:
+                reason = r.get("reason") or "failed"
+                label = _REASON_LABELS.get(reason, reason)
+                hint = _REASON_HINTS.get(reason, "")
+                status = f"[red]\u2717 {label}[/]" + (f"  [dim]{hint}[/]" if hint else "")
             table.add_row(
                 str(r["ctx"]), str(r["ngl"]), str(r["batch"]),
                 cold, warm, tps, trend, peak, status,
@@ -467,6 +502,80 @@ class HallOfFameWidget(Static):
     """
 
     def refresh_content(self, hof: dict) -> None:
+        # ---- Preset-bench scoring mode (scoring_complete event) ----
+        # Keys: _bench_scores (list), recommendation (str), goal (str), per_preset_ranges (dict)
+        if hof and "_bench_scores" in hof:
+            scores = hof["_bench_scores"]
+            recommendation = hof.get("recommendation", "")
+            per_preset_ranges = hof.get("per_preset_ranges", {})
+
+            # Column headers: rank, ngl, batch, score, then one col per preset
+            _PRESET_COL = {
+                "max_context":      ("max_ctx",   "ctx",   False),
+                "fastest_response": ("fast_ttft", "s",     True),
+                "throughput_king":  ("tok/s",     "tok/s", False),
+                "long_context_rag": ("rag_ttft",  "s",     True),
+            }
+            preset_order = ["max_context", "fastest_response", "throughput_king", "long_context_rag"]
+
+            # Determine which presets actually have data (any non-None value across rows)
+            active_presets = [
+                p for p in preset_order
+                if any(
+                    (e.get("preset_scores") or {}).get(p) is not None
+                    for e in scores
+                )
+            ]
+
+            table = Table(
+                show_header=True,
+                header_style="bold green",
+                padding=(0, 1),
+                expand=True,
+            )
+            table.add_column("Rank",  justify="center", min_width=5)
+            table.add_column("ngl",   justify="right",  min_width=4)
+            table.add_column("batch", justify="right",  min_width=5)
+            table.add_column("Score", justify="right",  min_width=7)
+            for p in active_presets:
+                col_header, unit, _ = _PRESET_COL[p]
+                table.add_column(f"{col_header}({unit})", justify="right", min_width=10)
+
+            for idx, entry in enumerate(scores):
+                is_best = idx == 0
+                rank_label = "#1 \u2605" if is_best else f"#{idx + 1}"
+                row_style = "bold green" if is_best else ""
+                preset_scores = entry.get("preset_scores") or {}
+                cells: list[str] = [
+                    rank_label,
+                    str(entry.get("ngl", "\u2014")),
+                    str(entry.get("batch", "\u2014")),
+                    f"{entry.get('final_score', 0.0):.3f}",
+                ]
+                for p in active_presets:
+                    raw = preset_scores.get(p)
+                    _, unit, _ = _PRESET_COL[p]
+                    if raw is None:
+                        cells.append("\u2014")
+                    elif unit == "ctx":
+                        cells.append(str(int(raw)))
+                    else:
+                        cells.append(f"{raw:.2f}")
+                table.add_row(*cells, style=row_style)
+
+            group_items: list = [table]
+            if recommendation:
+                from rich.text import Text as _Text
+                rec_t = _Text()
+                first_line = recommendation.splitlines()[0] if recommendation else ""
+                rec_t.append("\n\u2728 ", style="bold yellow")
+                rec_t.append(first_line, style="yellow")
+                group_items.append(rec_t)
+            from rich.console import Group as _Group
+            self.update(_Group(*group_items))
+            return
+
+        # ---- Explore mode (hall_of_fame event) ----
         keys = ["max_ctx", "fastest_ttft", "best_warm", "best_throughput", "best_balanced"]
         if not hof or not any(hof.get(k) for k in keys):
             self.update(Text(
@@ -502,9 +611,7 @@ class HallOfFameWidget(Static):
             )
         total = hof.get("total_tested", 0)
         rnd = hof.get("round_num", 1)
-        caption = Text(f"Round {rnd}  ·  {total} configs tested", style="dim")
         self.update(table)
-
 
 class RetriesWidget(Static):
     """OOM retry history."""
@@ -593,7 +700,7 @@ class BenchApp(App):
     """Textual application. Runs on a dedicated thread; updated via call_from_thread."""
 
     TITLE = "llama-bench"
-    SUB_TITLE = "GPU benchmarking & context tuner"
+    SUB_TITLE = f"v{__version__}  ·  {GIT_TIMESTAMP}  ·  GPU benchmarking & context tuner"
 
     CSS = """
     Screen {
@@ -686,11 +793,12 @@ class BenchApp(App):
     def _refresh_hardware(self) -> None:
         snap = self._hw_monitor.latest()  # type: ignore[union-attr]
         self._state.hw_snapshot = snap
-        # Track peak VRAM for current run
-        if self._state.run_start_time > 0:
-            for gpu in snap.gpus:
-                if gpu.vram_used_mb > self._state.current_run_peak_vram_mb:
-                    self._state.current_run_peak_vram_mb = gpu.vram_used_mb
+        # Track peak VRAM for current run — sum across ALL GPUs so multi-GPU
+        # setups report combined usage rather than per-card max.
+        if self._state.run_start_time > 0 and self._state.run_end_time == 0:
+            total_vram_mb = sum(gpu.vram_used_mb for gpu in snap.gpus)
+            if total_vram_mb > self._state.current_run_peak_vram_mb:
+                self._state.current_run_peak_vram_mb = total_vram_mb
         self.query_one(HardwareWidget).refresh_content(snap)
 
     def _tick(self) -> None:
@@ -812,7 +920,9 @@ class BenchApp(App):
         elif event == "retry":
             attempt = data.get("attempt", "?")
             max_r = data.get("max_retries", "?")
-            reason_label = _REASON_LABELS.get(data.get("reason", ""), data.get("reason", "?"))
+            reason_key = data.get("reason", "")
+            reason_label = _REASON_LABELS.get(reason_key, reason_key or "?")
+            reason_hint = _REASON_HINTS.get(reason_key, "")
             change = data.get("change", "?")
             ctx = data.get("ctx", "")
             ngl = data.get("ngl", "")
@@ -820,64 +930,80 @@ class BenchApp(App):
             msg = (
                 f"#{attempt}/{max_r} — {reason_label}  →  {change}\n"
                 f"  ctx={ctx} ngl={ngl} batch={batch}"
+                + (f"\n  Fix: {reason_hint}" if reason_hint else "")
             )
             s.retry_log.append(msg)
             self.query_one(RetriesWidget).refresh_content(s.retry_log)
-            self._activity(f"⟳  #{attempt}/{max_r}  {reason_label}  →  {change}")
+            self._activity(f"⟳  #{attempt}/{max_r}  {reason_label}  →  {change}" + (f"  ({reason_hint})" if reason_hint else ""))
         elif event == "hall_of_fame":
             s.hall_of_fame = dict(data)
             self.query_one(HallOfFameWidget).refresh_content(s.hall_of_fame)
 
-        elif event == "explore_round":
-            s.phase_desc = data.get("phase_desc", "")
-            s.progress_current = data.get("progress_current", 0)
-            s.progress_total = data.get("progress_total", 1)
-            attempt = data.get("attempt", "?")
-            max_r = data.get("max_retries", "?")
-            reason_label = _REASON_LABELS.get(
-                data.get("reason", ""), data.get("reason", "?")
-            )
-            change = data.get("change", "?")
-            ctx = data.get("ctx", "")
-            ngl = data.get("ngl", "")
-            batch = data.get("batch", "")
-            msg = (
-                f"#{attempt}/{max_r} — {reason_label}  →  {change}\n"
-                f"  ctx={ctx} ngl={ngl} batch={batch}"
-            )
-            s.retry_log.append(msg)
-            self.query_one(RetriesWidget).refresh_content(s.retry_log)
-            self._activity(f"⟳  #{attempt}/{max_r}  {reason_label}  →  {change}")
+        elif event == "orchestrator_preset_start":
+            preset = data.get("preset", "?")
+            phase_index = data.get("phase_index", "?")
+            total_phases = data.get("total_phases", "?")
+            s.phase_desc = f"Phase {phase_index}/{total_phases}: {preset}"
+            s.progress_current = 0
+            s.progress_total = max(int(total_phases or 1), 1)
+            self._activity(f"\u25b6  Starting preset {phase_index}/{total_phases}: {preset}")
 
-        elif event == "run_done":
-            tps = data.get("tokens_per_sec", 0.0)
-            if tps > 0:
-                s.tps_history.append(tps)
-            ok = data.get("success", False)
-            s.results.append({
-                "ctx": data.get("ctx", 0),
-                "ngl": data.get("ngl", 0),
-                "batch": data.get("batch", 0),
-                "cold_ttft_s": data.get("cold_ttft_s", 0.0),
-                "warm_ttft_s": data.get("warm_ttft_s", 0.0),
-                "tokens_per_sec": tps,
-                "success": ok,
-                "reason": data.get("reason"),
-                "peak_vram_mb": s.current_run_peak_vram_mb,
-            })
-            self.query_one(ResultsWidget).refresh_content(s)
-            ctx = data.get("ctx", "?")
-            if ok:
-                cold = data.get("cold_ttft_s", 0.0)
+        elif event == "orchestrator_preset_done":
+            preset = data.get("preset", "?")
+            phase_index = data.get("phase_index", "?")
+            total_phases = data.get("total_phases", "?")
+            skipped = data.get("skipped", False)
+            best_value = data.get("best_value")
+            primary_metric = data.get("primary_metric", "")
+            s.progress_current = int(phase_index or 0)
+            if skipped:
+                self._activity(f"\u23ed  Preset {preset} skipped (weight=0)")
+            elif best_value is not None:
                 self._activity(
-                    f"✓  ctx={ctx}  TTFT {cold:.2f}s  {tps:.1f} tok/s"
+                    f"\u2713  Preset {preset} done  \u2014  best {primary_metric}: {best_value}"
                 )
             else:
-                reason = data.get("reason", "failed")
-                self._activity(
-                    f"✗  ctx={ctx}  {_REASON_LABELS.get(reason, reason)}"
-                )
+                self._activity(f"\u2713  Preset {preset} done (no successful runs)")
 
+        elif event == "preset_phase_start":
+            preset = data.get("preset", "?")
+            description = data.get("description", "")
+            label = f"{preset}" + (f": {description}" if description else "")
+            self._activity(f"  \u25b7  {label}")
+
+        elif event == "preset_phase_done":
+            preset = data.get("preset", "?")
+            success = data.get("success", False)
+            best_value = data.get("best_value")
+            primary_metric = data.get("primary_metric", "")
+            if success and best_value is not None:
+                self._activity(
+                    f"  \u2714  {preset}  {primary_metric}={best_value}"
+                )
+            elif not success:
+                self._activity(f"  \u2716  {preset} phase failed")
+
+        elif event == "scoring_complete":
+            top_scores = data.get("scores", [])
+            recommendation = data.get("recommendation", "")
+            hof: dict = {
+                "_bench_scores": top_scores,
+                "recommendation": recommendation,
+                "goal": data.get("goal", ""),
+                "per_preset_ranges": data.get("per_preset_ranges", {}),
+            }
+            s.hall_of_fame = hof
+            self.query_one(HallOfFameWidget).refresh_content(s.hall_of_fame)
+            self._activity(f"\u2b50  Scoring done. {recommendation.splitlines()[0] if recommendation else ''}")
+
+        elif event == "explore_round":
+            s.phase_desc = data.get("phase_desc", s.phase_desc)
+            pc = data.get("progress_current")
+            pt = data.get("progress_total")
+            if pc is not None:
+                s.progress_current = int(pc)
+            if pt is not None:
+                s.progress_total = int(pt)
     def _on_progress(self, current: int, total: int, phase: int, phase_name: str) -> None:
         s = self._state
         if s.sweep_start_time == 0.0 and current == 0:
@@ -887,3 +1013,21 @@ class BenchApp(App):
         if not s.phase_desc:
             s.phase_desc = f"Phase {phase} — {phase_name}"
         self.query_one(ProgressWidget).refresh_content(s)
+
+    def _on_bench_complete(self) -> None:
+        """Called from the worker thread (via call_from_thread) when the bench
+        finishes normally. Keeps the TUI open so the user can review results.
+        Updates the activity log and header to make completion obvious.
+        The user closes the TUI by pressing q.
+        """
+        # Freeze the elapsed timer.
+        if self._state.run_start_time > 0 and self._state.run_end_time == 0:
+            self._state.run_end_time = time.monotonic()
+        self._activity("\u2705  Benchmark complete \u2014 press q to close and view full report")
+        # Update binding label from 'Quit' to 'Close' to hint the user.
+        # We swap the binding by removing the old one and adding a new one.
+        self.BINDINGS = [("q", "quit", "Close"), ("ctrl+c", "quit", "Close")]
+        # Update the phase display to show we're done.
+        self._state.phase_desc = "\u2713 DONE"
+        self._state.request_step = "Benchmark complete \u2014 press q to close"
+        self.query_one(CurrentRunWidget).refresh_content(self._state)

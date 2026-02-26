@@ -251,11 +251,39 @@ class BenchConfig:
     cont_batching: bool = True
     threads: int = 8
     threads_batch: int = 8
+    threads_http: int = -1  # -1 = don't pass (llama-server default)
 
+    # Memory / system
+    mmap: bool = True
+    mlock: bool = False
+    numa: Optional[str] = None  # None | 'distribute' | 'isolate' | 'numactl'
+    prio: int = 0  # -1=low, 0=normal, 1=medium, 2=high, 3=realtime
+    poll: int = -1  # -1 = don't pass (llama-server default 50)
+    cpu_mask: Optional[str] = None  # hex affinity mask
+    cpu_range: Optional[str] = None  # 'lo-hi' core range
+
+    # KV cache / slot
+    defrag_thold: float = -1.0  # -1 = don't pass (llama-server default)
+    slot_prompt_similarity: float = -1.0  # -1 = don't pass (llama-server default 0.10)
+
+    # Attention extensions
+    grp_attn_n: int = -1  # -1 = don't pass (llama-server default 1)
+    grp_attn_w: int = -1  # -1 = don't pass (llama-server default 512)
+    context_shift: bool = False  # --context-shift (default off)
+
+    # RoPE / context extension
+    rope_scaling: Optional[str] = None  # None | 'none' | 'linear' | 'yarn'
+    rope_freq_base: float = -1.0  # -1 = don't pass
+    rope_freq_scale: float = -1.0  # -1 = don't pass
+
+    # Speculative decoding
+    model_draft: Optional[str] = None  # path to draft model .gguf
+    draft_n: int = -1  # -1 = don't pass (llama-server default 16)
+    draft_n_min: int = -1  # -1 = don't pass (llama-server default 0)
+    n_gpu_layers_draft: int = -1  # -1 = don't pass
 
     # Generation limits
     max_predict_tokens: int = 512
-
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -352,16 +380,44 @@ def configs_from_args(
     cache_type_k: str = "q8_0",
     cache_type_v: str = "q8_0",
     kv_unified: bool = True,
+    kv_offload: bool = True,
     cache_reuse: int = 512,
     cont_batching: bool = True,
     threads: int = 8,
     threads_batch: int = 8,
+    threads_http: int = -1,
     split_mode: str = "none",
+    tensor_split: str = "",
+    main_gpu: int = 0,
     max_predict_tokens: int = 512,
     vk_devices: Optional[str] = None,
     use_sudo: bool = True,
     engine: str = "vulkan",
     device: Optional[str] = None,
+    # Memory / system
+    mmap: bool = True,
+    mlock: bool = False,
+    numa: Optional[str] = None,
+    prio: int = 0,
+    poll: int = -1,
+    cpu_mask: Optional[str] = None,
+    cpu_range: Optional[str] = None,
+    # KV cache / slot
+    defrag_thold: float = -1.0,
+    slot_prompt_similarity: float = -1.0,
+    # Attention extensions
+    grp_attn_n: int = -1,
+    grp_attn_w: int = -1,
+    context_shift: bool = False,
+    # RoPE / context extension
+    rope_scaling: Optional[str] = None,
+    rope_freq_base: float = -1.0,
+    rope_freq_scale: float = -1.0,
+    # Speculative decoding
+    model_draft: Optional[str] = None,
+    draft_n: int = -1,
+    draft_n_min: int = -1,
+    n_gpu_layers_draft: int = -1,
     **_kwargs: Any,
 ) -> BenchConfig:
     """Build a :class:`BenchConfig` from CLI keyword arguments."""
@@ -377,16 +433,39 @@ def configs_from_args(
         np=np,
         ctx=ctx,
         n_gpu_layers=n_gpu_layers,
+        split_mode=split_mode,
+        tensor_split=tensor_split,
+        main_gpu=main_gpu,
         flash_attn=flash_attn,
         batch_size=batch_size,
         ubatch_size=ubatch_size,
+        kv_unified=kv_unified,
+        kv_offload=kv_offload,
         cache_type_k=cache_type_k,
         cache_type_v=cache_type_v,
-        kv_unified=kv_unified,
         cache_reuse=cache_reuse,
         cont_batching=cont_batching,
         threads=threads,
         threads_batch=threads_batch,
-        split_mode=split_mode,
+        threads_http=threads_http,
+        mmap=mmap,
+        mlock=mlock,
+        numa=numa,
+        prio=prio,
+        poll=poll,
+        cpu_mask=cpu_mask,
+        cpu_range=cpu_range,
+        defrag_thold=defrag_thold,
+        slot_prompt_similarity=slot_prompt_similarity,
+        grp_attn_n=grp_attn_n,
+        grp_attn_w=grp_attn_w,
+        context_shift=context_shift,
+        rope_scaling=rope_scaling,
+        rope_freq_base=rope_freq_base,
+        rope_freq_scale=rope_freq_scale,
+        model_draft=model_draft,
+        draft_n=draft_n,
+        draft_n_min=draft_n_min,
+        n_gpu_layers_draft=n_gpu_layers_draft,
         max_predict_tokens=max_predict_tokens,
     )

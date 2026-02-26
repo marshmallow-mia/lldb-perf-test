@@ -55,7 +55,7 @@ class TunerThresholds:
     """Minimum performance thresholds that define a "usable" config."""
 
     max_ttft_s: Optional[float] = None
-    min_tokens_per_sec: float = 4.0
+    min_tokens_per_sec: float = 1.0
 
 
 @dataclass

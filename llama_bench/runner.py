@@ -85,6 +85,66 @@ def _build_server_cmd(cfg: BenchConfig) -> list[str]:
     if cfg.device is not None:
         cmd += ["--device", cfg.device]
 
+    # --- Previously dead BenchConfig fields, now wired ---
+    if not cfg.kv_offload:
+        cmd.append("--no-kv-offload")
+    if cfg.tensor_split:
+        cmd += ["-ts", cfg.tensor_split]
+    if cfg.main_gpu != 0 or cfg.split_mode in ("row", "layer"):
+        cmd += ["-mg", str(cfg.main_gpu)]
+
+    # --- Memory / system ---
+    if not cfg.mmap:
+        cmd.append("--no-mmap")
+    if cfg.mlock:
+        cmd.append("--mlock")
+    if cfg.numa is not None:
+        cmd += ["--numa", cfg.numa]
+    if cfg.prio != 0:
+        cmd += ["--prio", str(cfg.prio)]
+    if cfg.poll >= 0:
+        cmd += ["--poll", str(cfg.poll)]
+    if cfg.cpu_mask is not None:
+        cmd += ["--cpu-mask", cfg.cpu_mask]
+    if cfg.cpu_range is not None:
+        cmd += ["--cpu-range", cfg.cpu_range]
+
+    # --- Threading ---
+    if cfg.threads_http >= 0:
+        cmd += ["--threads-http", str(cfg.threads_http)]
+
+    # --- KV cache / slot ---
+    if cfg.defrag_thold >= 0:
+        cmd += ["--defrag-thold", str(cfg.defrag_thold)]
+    if cfg.slot_prompt_similarity >= 0:
+        cmd += ["--slot-prompt-similarity", str(cfg.slot_prompt_similarity)]
+
+    # --- Attention extensions ---
+    if cfg.grp_attn_n > 0:
+        cmd += ["--grp-attn-n", str(cfg.grp_attn_n)]
+    if cfg.grp_attn_w > 0:
+        cmd += ["--grp-attn-w", str(cfg.grp_attn_w)]
+    if cfg.context_shift:
+        cmd.append("--context-shift")
+
+    # --- RoPE / context extension ---
+    if cfg.rope_scaling is not None:
+        cmd += ["--rope-scaling", cfg.rope_scaling]
+    if cfg.rope_freq_base > 0:
+        cmd += ["--rope-freq-base", str(cfg.rope_freq_base)]
+    if cfg.rope_freq_scale > 0:
+        cmd += ["--rope-freq-scale", str(cfg.rope_freq_scale)]
+
+    # --- Speculative decoding ---
+    if cfg.model_draft is not None:
+        cmd += ["--model-draft", cfg.model_draft]
+    if cfg.draft_n >= 0:
+        cmd += ["--draft", str(cfg.draft_n)]
+    if cfg.draft_n_min >= 0:
+        cmd += ["--draft-min", str(cfg.draft_n_min)]
+    if cfg.n_gpu_layers_draft >= 0:
+        cmd += ["--n-gpu-layers-draft", str(cfg.n_gpu_layers_draft)]
+
     return cmd
 
 
@@ -352,9 +412,9 @@ class BenchmarkRunner:
             cmd_str = " ".join(_build_server_cmd(self.cfg))
             self._emit("server_starting", command=cmd_str, stderr_path=handle.stderr_path, pid=handle.pid)
             logger.info("Starting server for run (config_hash will be assigned per-prompt)")
-            logger.info("Waiting for server to become ready (timeout=90s)")
+            logger.info("Waiting for server to become ready (timeout=300s)")
             startup_failure = wait_for_server_ready(
-                self.cfg.host, self.cfg.port, timeout=90.0,
+                self.cfg.host, self.cfg.port, timeout=300.0,
                 proc=handle.process,
                 event_cb=lambda ev, d: self._emit(ev, **d),
                 stop_event=self._stop_event,
