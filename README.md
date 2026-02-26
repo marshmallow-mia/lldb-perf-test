@@ -15,20 +15,22 @@ and use-case.
 3. [Prerequisites](#prerequisites)
 4. [Quick Start](#quick-start)
 5. [Full CLI Reference](#full-cli-reference)
-6. [TUI Dashboard](#tui-dashboard)
-7. [Graceful Shutdown](#graceful-shutdown)
-8. [Hardware Monitoring](#hardware-monitoring)
-9. [Vulkan GPU Discovery](#vulkan-gpu-discovery)
-10. [Prompt Workload](#prompt-workload)
-11. [Custom Prompt Packs](#custom-prompt-packs)
-12. [Profile Files](#profile-files)
-13. [OOM-Adaptive Retry Strategy](#oom-adaptive-retry-strategy)
-14. [Output Formats](#output-formats)
-15. [Verbose Logging](#verbose-logging)
-16. [Security Notes](#security-notes)
-17. [Version Compatibility](#version-compatibility)
-18. [Troubleshooting](#troubleshooting)
-19. [Architecture](#architecture)
+6. [4-Preset Characterization Bench](#4-preset-characterization-bench)
+7. [Goal Presets & Scoring](#goal-presets--scoring)
+8. [TUI Dashboard](#tui-dashboard)
+9. [Graceful Shutdown](#graceful-shutdown)
+10. [Hardware Monitoring](#hardware-monitoring)
+11. [Vulkan GPU Discovery](#vulkan-gpu-discovery)
+12. [Prompt Workload](#prompt-workload)
+13. [Custom Prompt Packs](#custom-prompt-packs)
+14. [Profile Files](#profile-files)
+15. [OOM-Adaptive Retry Strategy](#oom-adaptive-retry-strategy)
+16. [Output Formats](#output-formats)
+17. [Verbose Logging](#verbose-logging)
+18. [Security Notes](#security-notes)
+19. [Version Compatibility](#version-compatibility)
+20. [Troubleshooting](#troubleshooting)
+21. [Architecture](#architecture)
 
 ---
 
@@ -44,9 +46,11 @@ so you can make an informed choice — all without writing a single line of code
 
 **Key features:**
 
-- **`bench`** — Adaptive single-config tuner: sweeps context sizes from max down to min,
-  retrying on OOM by reducing `n-gpu-layers` and `batch-size`, collecting cold and warm
-  TTFT plus decode throughput at each step.
+- **`bench`** — 4-preset characterization bench: runs four independent performance
+  sweeps (max context, fastest response, throughput, long-context RAG), then applies
+  user-selected goal weights (20 points across 4 presets) to compute a normalized
+  weighted score and recommend the optimal `(ngl, batch)` configuration for your
+  specific use-case.
 - **`search`** — Staged two-phase parameter search: coarse sweep over the full config
   space, then refines the top 25% for higher-fidelity measurements. Supports early
   stopping.
@@ -96,22 +100,34 @@ The CLI entry point `llama-bench` is installed automatically.
 
 ## Quick Start
 
-### Run a single adaptive benchmark
+### Run a preset characterization bench (default goal: `general`)
 
 ```bash
 llama-bench bench --model /path/to/model.gguf
 ```
 
-Override the binary path and starting configuration:
+Target a specific use-case — e.g. coding assistant (fast TTFT matters most):
 
 ```bash
 llama-bench bench \
   --server /opt/llama.cpp/llama-server \
   --model /data/models/codellama-34b.Q5_K_M.gguf \
+  --goal coding \
   --n-gpu-layers 48 \
-  --ctx 65536 \
   --flash-attn \
-  --output results/codellama_bench.jsonl
+  --output results/codellama_coding.jsonl
+```
+
+Use a custom 20-point weight budget across all four presets:
+
+```bash
+llama-bench bench \
+  --model /data/models/my-model.gguf \
+  --goal custom \
+  --w-max-context 8 \
+  --w-fastest-response 4 \
+  --w-throughput 4 \
+  --w-long-context-rag 4
 ```
 
 ### Run a staged parameter search
@@ -157,9 +173,23 @@ llama-bench report results/bench_*.jsonl --output results/report.md
 
 ### `llama-bench bench`
 
-Run a benchmark with a single base configuration. The tool sweeps context sizes from
-`--ctx` (or `--ctx-max`) down to `--ctx-min` in steps of `--ctx-step`, applying
-OOM-adaptive retry logic at each step.
+Runs the **4-preset characterization bench**. Each preset sweeps its own parameter
+space independently, then the results are combined using a 20-point goal-weight budget
+to recommend the optimal `(ngl, batch)` server configuration for your use-case.
+
+**Preset-specific flags** (new):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--goal` | `general` | Optimization goal: `reverse_engineering`, `coding`, `chatting`, `rag_research`, `general`, or `custom` |
+| `--w-max-context` | `5` | Weight for max-context phase (`--goal custom` only; all 4 weights must sum to 20) |
+| `--w-fastest-response` | `5` | Weight for fastest-response phase (`--goal custom` only) |
+| `--w-throughput` | `5` | Weight for throughput phase (`--goal custom` only) |
+| `--w-long-context-rag` | `5` | Weight for long-context RAG phase (`--goal custom` only) |
+| `--ngl-tests` | base ngl only | Comma-separated ngl values to sweep in grid presets, e.g. `40,43,45` |
+| `--batch-tests` | base batch only | Comma-separated batch-size values to sweep, e.g. `1024,1536` |
+
+**Shared server flags** (inherited by all modes):
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -285,6 +315,101 @@ llama-bench report <file1.jsonl> [file2.jsonl ...] [--output report.md] [--top-n
 |------|---------|-------------|
 | `--output`, `-o` | `<input>_report.md` | Markdown output path |
 | `--top-n` | `10` | Number of top results to include in the ranked table |
+
+---
+
+## 4-Preset Characterization Bench
+
+`bench` mode runs four independent sweeps to characterize your hardware and model across
+four performance dimensions, then computes a weighted score to surface the optimal
+`(n-gpu-layers, batch-size)` pair for your target use-case.
+
+### The 4 Presets
+
+**1. `max_context`** — *How much context can my hardware actually hold?*
+
+- Sweeps context sizes high → low, retrying on OOM (adaptive ngl/batch reduction)
+- Short prompt, `max_tokens=32`, no follow-ups
+- **Primary metric**: highest successful context size
+- Results feed into `long_context_rag` to skip known-OOM context sizes
+
+**2. `fastest_response`** — *What is the minimum time-to-first-token?*
+
+- Fixed `ctx=4096`, sweeps the `ngl × batch` grid (via `--ngl-tests` / `--batch-tests`)
+- Short prompt (~300 tokens), `max_tokens=128`, no follow-ups
+- **Primary metric**: cold TTFT (lower is better)
+
+**3. `throughput_king`** — *What is the peak decode throughput?*
+
+- Fixed `ctx=8192`, sweeps the `ngl × batch` grid
+- Short input, `max_tokens=2048`, no follow-ups
+- **Primary metric**: tokens/second (higher is better)
+
+**4. `long_context_rag`** — *How fast is the first-token at near-max context?*
+
+- Context candidates: `[32768, 65536, 131072]` (skips sizes that failed `max_context`)
+- Synthetic padding (lorem ipsum) fills the context; short question appended at end
+- `max_tokens=256`, 1 follow-up
+- **Primary metric**: cold TTFT at the largest successful context (lower is better)
+
+### Execution Order
+
+```
+max_context → fastest_response → throughput_king → long_context_rag
+```
+
+Presets with weight=0 are skipped entirely (saves runtime).
+
+---
+
+## Goal Presets & Scoring
+
+After all presets complete, results are combined using a **20-point weight budget** that
+you allocate across the four presets. Each preset's raw metric is min-max normalized,
+inverted where lower-is-better, then weighted:
+
+```
+final_score(ngl, batch) = Σ( weight_i × normalized_i ) / 20
+```
+
+The `(ngl, batch)` pair with the highest final score is the recommended server configuration.
+
+### Builtin Goal Presets
+
+| Goal | max_context | fastest_response | throughput | long_context_rag |
+|------|-------------|-----------------|-----------|-----------------|
+| `reverse_engineering` | 12 | 1 | 3 | 4 |
+| `coding` | 3 | 10 | 5 | 2 |
+| `chatting` | 3 | 8 | 5 | 4 |
+| `rag_research` | 4 | 2 | 2 | 12 |
+| `general` *(default)* | 5 | 5 | 5 | 5 |
+| `custom` | set via flags | set via flags | set via flags | set via flags |
+
+All builtin weights sum to exactly 20. The `custom` goal requires you to set all four
+`--w-*` flags such that they sum to 20 — the CLI rejects runs where they do not.
+
+### Selecting a Goal
+
+Via the interactive menu:
+```
+llama-bench          # opens the TUI menu — pick bench mode, then select a goal
+```
+
+Via CLI:
+```bash
+llama-bench bench --model /path/to/model.gguf --goal coding
+
+# Custom weights (must sum to 20)
+llama-bench bench --model /path/to/model.gguf --goal custom \
+  --w-max-context 10 --w-fastest-response 5 --w-throughput 3 --w-long-context-rag 2
+```
+
+### Bench Output
+
+On completion, `bench` writes:
+- **JSONL** — one record per attempt across all presets (`--output`)
+- **Markdown report** — preset summaries + scoring table + recommendation
+- **Summary JSON** — machine-readable optimal config (`--summary`)
 
 ---
 
@@ -771,6 +896,7 @@ llama_bench/
 │                        # build_prompt_sequence, load_prompt_pack (JSON/YAML)
 │                        # load_corpus_files (README.md, agent.md, artifacts.md)
 ├── report.py            # generate_markdown_report, load_results, print_summary_table
+│                        # generate_bench_report (4-preset Markdown report)
 ├── gpu.py               # discover_vulkan_gpus (vulkaninfo), default_vk_devices
 │                        # build_env (GGML_VK_VISIBLE_DEVICES injection)
 ├── hw_monitor.py        # HWMonitor: background polling of GPU/CPU/RAM metrics
@@ -778,8 +904,19 @@ llama_bench/
 ├── tui.py               # BenchTUI: 11-panel Textual dashboard
 │                        # Graceful q/Ctrl+C handling, SIGKILL fallback for sudo children
 │                        # handle_event, update_progress, set_best
-└── logging_setup.py     # setup_logging: configures file + stderr handlers
-                         # Verbosity levels: 0=WARNING, 1=INFO, 2=DEBUG
+├── logging_setup.py     # setup_logging: configures file + stderr handlers
+│                        # Verbosity levels: 0=WARNING, 1=INFO, 2=DEBUG
+│
+│   # New files (4-preset bench system):
+├── presets.py           # PresetConfig, PresetResult, GoalPreset dataclasses
+│                        # BUILTIN_GOALS, PRESET_REGISTRY, ALL_PRESET_NAMES
+│                        # PresetRunner: runs each preset sweep independently
+│                        # get_goal_preset factory (builtin + custom)
+├── scoring.py           # ConfigScore, ScoringResult dataclasses
+│                        # score_presets(results, goal): min-max normalize + weighted sum
+│                        # _generate_recommendation: picks optimal (ngl, batch)
+└── orchestrator.py      # OrchestratorResult, PresetBenchOrchestrator
+                         # Runs all 4 presets in order, emits TUI events, collects results
 ```
 
 ---

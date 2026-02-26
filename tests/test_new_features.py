@@ -89,9 +89,9 @@ class TestDetectVulkanUsed:
 # ---------------------------------------------------------------------------
 
 class TestTunerThresholdsDefaults:
-    def test_min_tokens_per_sec_default_is_4(self):
+    def test_min_tokens_per_sec_default_is_1(self):
         t = TunerThresholds()
-        assert t.min_tokens_per_sec == 4.0
+        assert t.min_tokens_per_sec == 1.0
 
     def test_max_ttft_s_default_is_none(self):
         t = TunerThresholds()
